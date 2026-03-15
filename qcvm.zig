@@ -259,6 +259,7 @@ const Vm = struct {
     temporary_strings_buffer: [:0]u8,
 
     // runtime fields
+    /// The number of arguments passed to a builtin function
     argc: u4,
 
     call_stack: [MAX_STACK_DEPTH]struct {
@@ -417,248 +418,98 @@ fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
         if (verbose_statements)
             std.log.debug("{s}", .{printStatement(&buf, vm.*, stmt) catch @panic("OOM")});
 
-        // @Cleanup cut down on ptr/bitCasting by using an extern union for values?
-        // @Cleanup compress similar codepaths
+        const GlobalValue = extern union {
+            float: f32,
+            uint: u32,
+            vector: [3]f32,
+            string: i32, // negative values are temporary strings
+            function: u32,
+            entity_index: u32,
+            entity_field_offset: u32,
+            entity_field_address: u32,
+        };
+
+        // Global registers accessed by statement arguments
+        // @Todo bounds checking for vectors
+        const a: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[0])]);
+        const b: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[1])]);
+        const c: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
+
         switch (stmt.op) {
-            .add_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = a + b;
-            },
-            .sub_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = a - b;
-            },
-            .mul_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = a * b;
-            },
-            .div_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = a / b;
-            },
+            .add_f => c.float = a.float + b.float,
+            .sub_f => c.float = a.float - b.float,
+            .mul_f => c.float = a.float * b.float,
+            .div_f => c.float = a.float / b.float,
 
-            .add_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                for (0..3) |i| c[i] = a[i] + b[i];
+            .add_v => for (0..3) |i| {
+                c.vector[i] = a.vector[i] + b.vector[i];
             },
-            .sub_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                for (0..3) |i| c[i] = a[i] - b[i];
+            .sub_v => for (0..3) |i| {
+                c.vector[i] = a.vector[i] - b.vector[i];
             },
-            .mul_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            .mul_fv => for (0..3) |i| {
+                c.vector[i] = a.float * b.vector[i];
             },
-            .mul_fv => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[2])..][0..3]);
-                for (0..3) |i| c[i] = a * b[i];
+            .mul_vf => for (0..3) |i| {
+                c.vector[i] = a.vector[i] * b.float;
             },
-            .mul_vf => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[2])..][0..3]);
-                for (0..3) |i| c[i] = a[i] * b;
-            },
+            .mul_v => c.float =
+                a.vector[0] * b.vector[0] +
+                a.vector[1] * b.vector[1] +
+                a.vector[2] * b.vector[2],
 
-            .bitand => {
-                const fa: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const fb: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
+            .bitand, .bitor => |op| {
                 // this casting is weird but matches Quake behavior
-                const a: i32 = @intFromFloat(fa);
-                const b: i32 = @intFromFloat(fb);
-                c.* = @floatFromInt(a & b);
+                const ai: i32 = @intFromFloat(a.float);
+                const bi: i32 = @intFromFloat(b.float);
+                c.float = @floatFromInt(if (op == .bitand) ai & bi else ai | bi);
             },
-            .bitor => {
-                const fa: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const fb: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                // this casting is weird but matches Quake behavior
-                const a: i32 = @intFromFloat(fa);
-                const b: i32 = @intFromFloat(fb);
-                c.* = @floatFromInt(a | b);
-            },
+            // the following "floatFromBool" casts are weird but match Quake behavior
+            .@"and" => c.float = floatFromBool(a.float != 0 and b.float != 0),
+            .@"or" => c.float = floatFromBool(a.float != 0 or b.float != 0),
 
-            .@"and" => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a != 0 and b != 0)); // this casting is weird but matches Quake behavior
-            },
-            .@"or" => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a != 0 or b != 0)); // this casting is weird but matches Quake behavior
-            },
+            .not_f => c.float = floatFromBool(a.float == 0),
+            .not_v => c.float = floatFromBool(a.vector[0] == 0 and a.vector[1] == 0 and a.vector[1] == 0),
+            .not_s => c.float = floatFromBool(a.string == 0 or vm.getString(a.string)[0] == 0), // check if string is null or empty
+            .not_ent => c.float = floatFromBool(a.entity_index == 0), // the 0th entity should be considered null and therefore false-y
+            .not_fnc => c.float = floatFromBool(a.function == 0), // same with functions
 
-            .not_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a == 0)); // this casting is weird but matches Quake behavior
-            },
-            .not_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a[0] == 0 and a[1] == 0 and a[1] == 0)); // this casting is weird but matches Quake behavior
-            },
-            .not_s => {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                // check if string is null or empty
-                c.* = @floatFromInt(@intFromBool(a == 0 or vm.getString(@bitCast(a))[0] == 0)); // this casting is weird but matches Quake behavior
-            },
-            .not_fnc => {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a == 0)); // this casting is weird but matches Quake behavior
-            },
-            .not_ent => {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                // the 0th entity should be considered null and therefore false-y
-                c.* = @floatFromInt(@intFromBool(a == 0)); // this casting is weird but matches Quake behavior
-            },
+            .eq_f => c.float = floatFromBool(a.float == b.float),
+            .eq_v => c.float = floatFromBool(std.mem.eql(f32, &a.vector, &b.vector)),
+            .eq_s => c.float = floatFromBool(std.mem.eql(u8, vm.getString(a.string), vm.getString(b.string))),
+            .eq_e => c.float = floatFromBool(a.entity_index == b.entity_index),
+            .eq_fnc => c.float = floatFromBool(a.function == b.function),
 
-            .eq_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a == b)); // this casting is weird but matches Quake behavior
-            },
-            .eq_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool( // this casting is weird but matches Quake behavior
-                    a[0] == b[0] and a[1] == b[1] and a[2] == b[2],
-                ));
-            },
-            .eq_s => {
-                const a: i32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: i32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool( // this casting is weird but matches Quake behavior
-                    std.mem.eql(u8, vm.getString(a), vm.getString(b)),
-                ));
-            },
-            .eq_e, .eq_fnc => {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const b: u32 = vm.globals[@intCast(stmt.args[1])];
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a == b)); // this casting is weird but matches Quake behavior
-            },
+            .ne_f => c.float = floatFromBool(a.float != b.float),
+            .ne_v => c.float = floatFromBool(!std.mem.eql(f32, &a.vector, &b.vector)),
+            .ne_s => c.float = floatFromBool(!std.mem.eql(u8, vm.getString(a.string), vm.getString(b.string))),
+            .ne_e => c.float = floatFromBool(a.entity_index != b.entity_index),
+            .ne_fnc => c.float = floatFromBool(a.function != b.function),
 
-            .ne_f => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a == b)); // this casting is weird but matches Quake behavior
-            },
-            .ne_v => {
-                const a: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const b: []const f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool( // this casting is weird but matches Quake behavior
-                    a[0] != b[0] or a[1] != b[1] or a[2] != b[2],
-                ));
-            },
-            .ne_s => {
-                const a: i32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: i32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool( // this casting is weird but matches Quake behavior
-                    !std.mem.eql(u8, vm.getString(a), vm.getString(b)),
-                ));
-            },
-            .ne_e, .ne_fnc => {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const b: u32 = vm.globals[@intCast(stmt.args[1])];
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a != b)); // this casting is weird but matches Quake behavior
-            },
-
-            .ge => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a >= b)); // this casting is weird but matches Quake behavior
-            },
-            .le => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a <= b)); // this casting is weird but matches Quake behavior
-            },
-            .gt => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a > b)); // this casting is weird but matches Quake behavior
-            },
-            .lt => {
-                const a: f32 = @bitCast(vm.globals[@intCast(stmt.args[0])]);
-                const b: f32 = @bitCast(vm.globals[@intCast(stmt.args[1])]);
-                const c: *f32 = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
-                c.* = @floatFromInt(@intFromBool(a < b)); // this casting is weird but matches Quake behavior
-            },
+            .ge => c.float = floatFromBool(a.float >= b.float),
+            .le => c.float = floatFromBool(a.float <= b.float),
+            .gt => c.float = floatFromBool(a.float > b.float),
+            .lt => c.float = floatFromBool(a.float < b.float),
 
             // store value in global register
             .store_f,
             .store_ent,
-            .store_fld, // integers
+            .store_fld,
             .store_s,
-            .store_fnc, // pointers
-            => {
-                const rvalue: u32 = vm.globals[@intCast(stmt.args[0])];
-                const lvalue: *u32 = &vm.globals[@intCast(stmt.args[1])];
-                lvalue.* = rvalue;
-            },
-            .store_v => {
-                const rvalue: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const lvalue: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[1])..][0..3]);
-                @memcpy(lvalue, rvalue);
-            },
+            .store_fnc,
+            => b.uint = a.uint,
+            .store_v => @memcpy(&b.vector, &a.vector),
 
             // store value in entity field via its address
             .storep_f,
             .storep_ent,
-            .storep_fld, // integers
+            .storep_fld,
             .storep_s,
-            .storep_fnc, // pointers
-            => {
-                const rvalue: u32 = vm.globals[@intCast(stmt.args[0])];
-                const entity_field_address: u32 = vm.globals[@intCast(stmt.args[1])];
-
-                // old byte address version
-                // const entities_bytes: []u8 = @ptrCast(vm.entity_memory);
-                // const field_ptr: *align(1) u32 = @ptrCast(&entities_bytes[entity_field_address]);
-
-                const field_ptr: *u32 = &vm.entity_memory[entity_field_address];
-                field_ptr.* = rvalue;
-            },
+            .storep_fnc,
+            => vm.entity_memory[b.entity_field_address] = a.uint,
             .storep_v => {
-                const rvalue: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[0])..][0..3]);
-                const entity_field_address: u32 = vm.globals[@intCast(stmt.args[1])];
-
-                const field_ptr: []f32 = @ptrCast(vm.entity_memory[entity_field_address..][0..3]);
-                @memcpy(field_ptr, rvalue);
+                const field_ptr: []f32 = @ptrCast(vm.entity_memory[b.entity_field_address..][0..3]);
+                @memcpy(field_ptr, &a.vector);
             },
 
             // load value from entity field
@@ -668,56 +519,39 @@ fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
             .load_s,
             .load_fnc,
             => {
-                const entity_idx: u32 = vm.globals[@intCast(stmt.args[0])];
-                const field_offset: u32 = vm.globals[@intCast(stmt.args[1])];
-                const lvalue: *u32 = &vm.globals[@intCast(stmt.args[2])];
-
-                const field: u32 = vm.entity_memory[entity_idx * vm.num_entity_fields + field_offset];
-                lvalue.* = field;
+                const field_address = a.entity_index * vm.num_entity_fields + b.entity_field_offset;
+                const field: u32 = vm.entity_memory[field_address];
+                c.uint = field;
             },
             .load_v => {
-                const entity_idx: u32 = vm.globals[@intCast(stmt.args[0])];
-                const field_offset: u32 = vm.globals[@intCast(stmt.args[1])];
-                const lvalue: []f32 = @ptrCast(vm.globals[@intCast(stmt.args[2])..][0..3]);
-
-                const field_address = entity_idx * vm.num_entity_fields + field_offset;
+                const field_address = a.entity_index * vm.num_entity_fields + b.entity_field_offset;
                 const field: []f32 = @ptrCast(vm.entity_memory[field_address..][0..3]);
-                @memcpy(lvalue, field);
+                @memcpy(&c.vector, field);
             },
 
             // store entity field address in global register
             .address => {
-                const entity_idx: u32 = vm.globals[@intCast(stmt.args[0])];
-                const field_offset: u32 = vm.globals[@intCast(stmt.args[1])];
-                const lvalue: *u32 = &vm.globals[@intCast(stmt.args[2])];
-
-                // old byte address version
-                // // get entity field pointer
-                // const field_ptr: *u32 = &(vm.entity_memory[entity_idx * vm.num_entity_fields ..][field_offset]);
-                // // store offset from start of entities buffer
-                // lvalue.* = @intCast(@intFromPtr(field_ptr) - @intFromPtr(vm.entity_memory.ptr));
-
-                // hypothesis: the address instruction returns a host defined entity field id, which is used in
+                // The address instruction returns a host defined entity field id, which is used in
                 // storep_* instructions. The reason it's done this way is so the host entity data structure
                 // does not have to directly match the QuakeC representation. In other words, all QC entity fields do not have
                 // to be stored contiguously in memory. Quake utilizes this feature to store entities in the Edict (Entity Dictionary)
-                // data structure.
-
-                const field_address = entity_idx * vm.num_entity_fields + field_offset;
-                lvalue.* = field_address;
+                // data structure, which is why it returns an offset in bytes instead of ints.
+                //
+                // Here we have no such limitation, so just return the offset in ints. In the future,
+                // we could let the user define this mapping via a callback so they can use their own data layout.
+                c.entity_field_address = a.entity_index * vm.num_entity_fields + b.entity_field_offset;
             },
 
             .@"if", .ifnot, .goto => |op| {
-                const a: u32 = vm.globals[@intCast(stmt.args[0])];
-                const predicate, const jump_offset = switch (op) {
-                    .@"if" => .{ a != 0, stmt.args[1] },
-                    .ifnot => .{ a == 0, stmt.args[1] },
+                const jump: bool, const offset: i16 = switch (op) {
+                    .@"if" => .{ a.uint != 0, stmt.args[1] },
+                    .ifnot => .{ a.uint == 0, stmt.args[1] },
                     .goto => .{ true, stmt.args[0] },
                     else => unreachable,
                 };
-                if (predicate) {
-                    // note this is equivalent to program_counter +%= @as(i16, stmt.args[1])
-                    vm.program_counter +%= @as(u16, @bitCast(jump_offset));
+                if (jump) {
+                    // note this is equivalent to program_counter +%= @as(i16, offset)
+                    vm.program_counter +%= @as(u16, @bitCast(offset));
                     continue; // don't increment counter
                 }
             },
@@ -733,14 +567,12 @@ fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
             .call8,
             => |call| {
                 const num_args: u4 = @intCast(@intFromEnum(call) - @intFromEnum(Opcode.call0));
-                const func_id = vm.globals[@as(u16, @bitCast(stmt.args[0]))];
-                if (func_id == 0) {
-                    @panic("NULL function");
-                }
 
-                const next_func = &vm.funcs[func_id];
+                if (a.function == 0) @panic("null function");
+                const next_func = &vm.funcs[a.function];
+
                 if (next_func.first_statement < 0) {
-                    const builtin_id: u32 = @bitCast(-next_func.first_statement - 1);
+                    const builtin_id: u32 = @intCast(-next_func.first_statement - 1);
                     if (builtin_id >= vm.builtins.len) {
                         std.debug.panic("unimplemented builtin: {d}", .{builtin_id + 1});
                     }
@@ -752,21 +584,18 @@ fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
                 }
             },
 
-            .done => {
-                break :run_loop;
-            },
-            .@"return" => {
-                @memcpy(
+            .done, .@"return" => |op| {
+                if (op == .@"return") @memcpy(
                     vm.globals[@intFromEnum(Offset.@"return")..][0..3],
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
                 leaveVmFunction(vm);
-                if (exit_depth == vm.call_stack_depth)
+                if (op == .done or exit_depth == vm.call_stack_depth)
                     break :run_loop; // all done
             },
 
             .state => {
-                std.debug.panic("unimplemented opcode: state", .{});
+                @panic("unimplemented opcode: state");
             },
 
             _ => |op| std.debug.panic("invalid opcode: {d}", .{@intFromEnum(op)}),
@@ -840,8 +669,6 @@ fn leaveVmFunction(vm: *Vm) void {
     vm.current_function = vm.call_stack[vm.call_stack_depth].func;
     vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
 }
-
-// fn entityFieldPtr(vm: Vm, entity: u32, field_offset: u32) u32{}
 
 // entity spawn() = #1 : spawn;
 fn vmSpawn(vm: *Vm) void {
@@ -918,6 +745,10 @@ fn vmPrintInner(vm: *Vm, fmt: [*:0]const u8, w: *std.Io.Writer) std.Io.Writer.Er
         i += 2;
     }
     try w.writeByte(0);
+}
+
+inline fn floatFromBool(b: bool) f32 {
+    return @floatFromInt(@intFromBool(b));
 }
 
 fn subCString(strings: [:0]const u8, start_idx: usize) [:0]const u8 {
