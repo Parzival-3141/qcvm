@@ -15,8 +15,7 @@
 // along with this program; if not, write to the Free Software
 // Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
-const func_t = enum(u32) { _ };
-const string_t = enum(u32) { _ };
+// @Todo create handle types for strings/functions/entities?
 
 const ValueType = enum(u15) {
     void,
@@ -195,6 +194,9 @@ const Header = extern struct {
     entityfields: u32,
 };
 
+/// Quake's progdefs.h crc value
+const PROGDEFS_CRC = 5927;
+
 // ============================================================================
 
 const std = @import("std");
@@ -274,6 +276,9 @@ const Vm = struct {
     trace: bool,
     current_function: *const Function,
     program_counter: u32,
+
+    const MAX_STACK_DEPTH = 32;
+    const LOCALSTACK_SIZE = 2048;
 
     const BuiltinFn = *const fn (*Vm) void;
 
@@ -959,67 +964,3 @@ fn prettyFmtStruct(data: anytype) struct {
 } {
     return .{ .data = data };
 }
-
-// ============================================================================
-
-const eval_t = extern union {
-    string: string_t,
-    float: f32,
-    vector: [3]f32,
-    function: func_t,
-    int: c_int,
-    edict: c_int,
-};
-
-const builtin_t = *const fn () void;
-const prstack_t = struct {
-    s: c_int,
-    f: *Function,
-};
-const MAX_STACK_DEPTH = 32;
-const LOCALSTACK_SIZE = 2048;
-
-const QCVM = struct {
-    progs: *const Header,
-    // all these pointers derive their lengths from the header
-    functions: [*]const Function,
-    strings: [*:0]const u8,
-    globaldefs: [*]const Def,
-    fielddefs: [*]const Def,
-    statements: [*]const Statement,
-    global_struct: *globalvars_t,
-    globals: *[@sizeOf(globalvars_t) / @sizeOf(f32)]f32, // same as global_struct
-
-    edict_size: c_int, // in bytes
-
-    builtins: []const builtin_t,
-    // int numbuiltins;
-
-    argc: c_int,
-
-    call_stack: [MAX_STACK_DEPTH]prstack_t,
-    depth: c_int,
-
-    localstack: [LOCALSTACK_SIZE]c_int,
-    localstack_used: c_int,
-
-    trace: bool,
-    xfunction: *Function,
-    xstatement: c_int,
-
-    crc: u16,
-};
-
-// progdefs.q1
-const globalvars_t = extern struct {
-    //! QuakeC Global variables.
-    //! Must be kept in sync with defs.qc
-};
-
-const entvars_t = extern struct {
-    //! QuakeC Entity fields.
-    //! Must be kept in sync with defs.qc
-};
-
-/// Quake's progdefs.h crc value
-const PROGDEFS_CRC = 5927;
