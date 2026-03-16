@@ -17,7 +17,7 @@
 
 // @Todo create handle types for strings/functions/entities?
 
-const ValueType = enum(u15) {
+pub const ValueType = enum(u15) {
     void,
     string,
     float,
@@ -29,7 +29,7 @@ const ValueType = enum(u15) {
     _,
 };
 
-const Offset = enum(u16) {
+pub const Offset = enum(u16) {
     null = 0,
     @"return" = 1,
     parm0 = 4, // leave 3 ofs for each parm to hold vectors
@@ -43,7 +43,7 @@ const Offset = enum(u16) {
     reserved_ofs = 28,
 };
 
-const Opcode = enum(u16) {
+pub const Opcode = enum(u16) {
     done,
     mul_f,
     mul_v,
@@ -124,13 +124,13 @@ const Opcode = enum(u16) {
 };
 
 // dstatement_t
-const Statement = extern struct {
+pub const Statement = extern struct {
     op: Opcode,
     args: [3]i16,
 };
 
 // ddef_t
-const Def = extern struct {
+pub const Def = extern struct {
     type: packed struct(u16) {
         tag: ValueType,
         /// if DEF_SAVEGLOBGAL bit is set the variable needs
@@ -142,7 +142,7 @@ const Def = extern struct {
 };
 
 // dfunction_t
-const Function = extern struct {
+pub const Function = extern struct {
     /// negative numbers are builtins
     first_statement: i32,
     parm_start: u32,
@@ -159,13 +159,13 @@ const Function = extern struct {
     numparms: u32,
     parm_sizes: [MAX_PARMS]u8,
 
-    const MAX_PARMS = 8;
+    pub const MAX_PARMS = 8;
 };
 
-const PROG_VERSION = 6;
+pub const PROG_VERSION = 6;
 
 // dprograms_t
-const Header = extern struct {
+pub const Header = extern struct {
     version: u32,
     /// check of progsdefs header file
     crc: u32,
@@ -195,7 +195,7 @@ const Header = extern struct {
 };
 
 /// Quake's progdefs.h crc value
-const PROGDEFS_CRC = 5927;
+pub const PROGDEFS_CRC = 5927;
 
 // ============================================================================
 
@@ -205,33 +205,7 @@ const crc = @import("crc.zig");
 const assert = std.debug.assert;
 const native_endian = @import("builtin").cpu.arch.endian();
 
-pub fn main() !void {
-    var arena_inst: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-
-    var args = std.process.args();
-    std.debug.assert(args.skip());
-
-    const file_path = args.next() orelse return error.MissingArgument;
-    const verbose = if (args.next()) |arg| std.mem.eql(u8, arg, "-v") else false;
-    const prog_data = try std.fs.cwd().readFileAlloc(arena, file_path, 64 * 1024 * 1024);
-
-    var qcvm = try loadProgram(prog_data, false);
-
-    const max_entities = 32;
-    qcvm.temporary_strings_buffer = try arena.allocSentinel(u8, 1024, 0);
-    qcvm.entity_memory = try arena.alloc(u32, max_entities * qcvm.num_entity_fields);
-    qcvm.num_entities = max_entities;
-    qcvm.builtins = &.{
-        vmSpawn,
-        vmPrintf,
-        vmSprintf,
-    };
-    exec(&qcvm, "main", verbose);
-}
-
-const Vm = struct {
+pub const Vm = struct {
     version: u32,
     /// checksum of progsdefs header file
     progdefs_crc: u16,
@@ -280,21 +254,21 @@ const Vm = struct {
     const MAX_STACK_DEPTH = 32;
     const LOCALSTACK_SIZE = 2048;
 
-    const BuiltinFn = *const fn (*Vm) void;
+    pub const BuiltinFn = *const fn (*Vm) void;
 
-    fn getArgVector(vm: *const Vm, arg: u4) *[3]f32 {
+    pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
-    fn getArgInt(vm: *const Vm, arg: u4) i32 {
+    pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @bitCast(vm.globals[offset]);
     }
-    fn getArgFloat(vm: *const Vm, arg: u4) f32 {
+    pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @bitCast(vm.globals[offset]);
     }
-    fn getArgString(vm: *const Vm, arg: u4) [*:0]const u8 {
+    pub fn getArgString(vm: *const Vm, arg: u4) [*:0]const u8 {
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
     }
@@ -317,7 +291,7 @@ const Vm = struct {
     }
 };
 
-fn loadProgram(bytes: []u8, check_progdefs_crc: bool) !Vm {
+pub fn loadProgram(bytes: []u8, check_progdefs_crc: bool) !Vm {
     var progs_crc = crc.init;
     for (bytes) |b| crc.processByte(&progs_crc, b);
 
@@ -393,7 +367,7 @@ fn loadProgram(bytes: []u8, check_progdefs_crc: bool) !Vm {
     };
 }
 
-fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
+pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
     // @Todo add some sort of configure phase to the API where the user can
     // supply values to fulfill this contract.
     assert(vm.entity_memory.len == vm.num_entities * vm.num_entity_fields);
@@ -673,83 +647,6 @@ fn leaveVmFunction(vm: *Vm) void {
     vm.call_stack_depth -= 1;
     vm.current_function = vm.call_stack[vm.call_stack_depth].func;
     vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
-}
-
-// entity spawn() = #1 : spawn;
-fn vmSpawn(vm: *Vm) void {
-    const S = struct {
-        var active_entities: u32 = 0;
-    };
-    if (S.active_entities == vm.num_entities) @panic("exceeded entity limit");
-    S.active_entities += 1;
-    vm.globals[@intFromEnum(Offset.@"return")] = S.active_entities;
-}
-
-// void printf(string s, ...) = #2 : printf;
-fn vmPrintf(vm: *Vm) void {
-    if (vm.argc == 0) @panic("too few arguments");
-    const fmt = vm.getArgString(0);
-
-    var buf: [256]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-
-    vmPrintInner(vm, fmt, &stdout.interface) catch @panic("write error");
-    stdout.end() catch @panic("write error");
-}
-
-// string sprintf(string s, ...) = #3 : sprintf;
-fn vmSprintf(vm: *Vm) void {
-    if (vm.argc == 0) @panic("too few arguments");
-    const fmt = vm.getArgString(0);
-
-    var w: std.Io.Writer = .fixed(vm.temporary_strings_buffer[1..]);
-
-    vmPrintInner(vm, fmt, &w) catch @panic("write error");
-    w.flush() catch unreachable;
-
-    vm.temporary_strings_buffer[0] = 0;
-    vm.globals[@intFromEnum(Offset.@"return")] = @bitCast(@as(i32, -1));
-}
-
-fn vmPrintInner(vm: *Vm, fmt: [*:0]const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    var arg: u4 = 1;
-    var i: usize = 0;
-    while (fmt[i] != 0) {
-        if (fmt[i] != '%') {
-            try w.writeByte(fmt[i]);
-            i += 1;
-            continue;
-        }
-
-        if (arg >= vm.argc and fmt[i + 1] != '%') {
-            // std.debug.panic("unused format argument {d}", .{arg});
-            break;
-        }
-        switch (fmt[i + 1]) {
-            0 => std.debug.panic("missing format specifier for argument {d}", .{arg}),
-            '%' => try w.writeByte('%'),
-            's' => { // string
-                try w.writeAll(std.mem.span(vm.getArgString(arg)));
-                arg += 1;
-            },
-            'f' => { // float
-                try w.printFloat(vm.getArgFloat(arg), .{});
-                arg += 1;
-            },
-            'd' => { // signed int
-                try w.printInt(vm.getArgInt(arg), 10, .lower, .{});
-                arg += 1;
-            },
-            'v' => { // vec3
-                const vec = vm.getArgVector(arg);
-                try w.print("{d}, {d}, {d}", .{ vec[0], vec[1], vec[2] });
-                arg += 1;
-            },
-            else => std.debug.panic("invalid format specifier '{c}' for argument {d}", .{ fmt[i + 1], arg }),
-        }
-        i += 2;
-    }
-    try w.writeByte(0);
 }
 
 inline fn floatFromBool(b: bool) f32 {

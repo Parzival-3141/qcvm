@@ -1,19 +1,3 @@
-// // #pragma target vanilla
-// #pragma target standard
-// // #pragma progs_dat progs.dat
-// // #pragma autoproto
-
-// // #pragma warning disable Q208
-// void end_sys_globals;
-// void end_sys_fields;
-
-// // print is the builtin function #1
-// void (string str) print = #1;
-
-// void() main = {
-//     print("hello world");
-// };
-
 //==============================================================================
 //
 // MIT License
