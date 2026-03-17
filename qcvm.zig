@@ -333,8 +333,19 @@ pub const Vm = struct {
         vm.globals[@intFromEnum(Offset.@"return")] = @bitCast(float);
     }
     /// Copies the string into temporary_strings_buffer.
+    /// If there is not enough space it will return the null string value instead.
     pub fn setReturnValueString(vm: *Vm, string: []const u8) void {
-        if (string.len > vm.temporary_strings_buffer.len) @panic("OOM"); // @Cleanup
+        if (string.len <= vm.temporary_strings_buffer.len) {
+            vm.setReturnValueStringAssumeCapacity(string);
+        } else {
+            vm.globals[@intFromEnum(Offset.@"return")] = 0;
+            // @Incomplete return an error?
+        }
+    }
+
+    /// Copies the string into temporary_strings_buffer.
+    pub fn setReturnValueStringAssumeCapacity(vm: *Vm, string: []const u8) void {
+        assert(string.len <= vm.temporary_strings_buffer.len);
         // @Todo ensure temp string allocation is compatible with vanilla Quake
         // @Todo we could be more clever about how temp strings are allocated,
         // like using a bump allocator, or a circular buffer of fixed size strings,
