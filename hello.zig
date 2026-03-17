@@ -34,7 +34,7 @@ fn vmSpawn(vm: *quakec.Vm) void {
     };
     if (S.active_entities == vm.num_entities) @panic("exceeded entity limit");
     S.active_entities += 1;
-    vm.globals[@intFromEnum(quakec.Offset.@"return")] = S.active_entities;
+    vm.setReturnValueEntityIndex(S.active_entities);
 }
 
 // void printf(string s, ...) = #2 : printf;
@@ -54,13 +54,12 @@ fn vmSprintf(vm: *quakec.Vm) void {
     if (vm.argc == 0) @panic("too few arguments");
     const fmt = vm.getArgString(0);
 
-    var w: std.Io.Writer = .fixed(vm.temporary_strings_buffer[1..]);
+    var w: std.Io.Writer = .fixed(vm.temporary_strings_buffer);
 
     vmPrintInner(vm, fmt, &w) catch @panic("write error");
     w.flush() catch unreachable;
 
-    vm.temporary_strings_buffer[0] = 0;
-    vm.globals[@intFromEnum(quakec.Offset.@"return")] = @bitCast(@as(i32, -1));
+    vm.setReturnValueManuallyFilledTempString(0);
 }
 
 fn vmPrintInner(
@@ -78,14 +77,13 @@ fn vmPrintInner(
         }
 
         if (arg >= vm.argc and fmt[i + 1] != '%') {
-            // std.debug.panic("unused format argument {d}", .{arg});
-            break;
+            std.debug.panic("unused format argument {d}", .{arg});
         }
         switch (fmt[i + 1]) {
             0 => std.debug.panic("missing format specifier for argument {d}", .{arg}),
             '%' => try w.writeByte('%'),
             's' => { // string
-                try w.writeAll(std.mem.span(vm.getArgString(arg)));
+                try w.writeAll(vm.getArgString(arg));
                 arg += 1;
             },
             'f' => { // float

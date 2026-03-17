@@ -224,7 +224,7 @@ pub const Vm = struct {
 
     num_entity_fields: u32,
 
-    ///////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////
     // The following fields should be set by the user before execution.
 
     /// User supplied builtin functions
@@ -245,7 +245,7 @@ pub const Vm = struct {
     /// User supplied string buffer
     temporary_strings_buffer: [:0]u8,
 
-    ///////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////
     // The following fields are managed by the runtime.
 
     /// The number of arguments passed to a builtin function
@@ -299,21 +299,57 @@ pub const Vm = struct {
         .program_counter = 0,
     };
 
+    ///////////////////////////////////////////////////////////////////////////
+    // User builtin function I/O helpers
+
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
+        assert(arg < 8);
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
     pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
+        assert(arg < 8);
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
+        assert(arg < 8);
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return @bitCast(vm.globals[offset]);
     }
-    pub fn getArgString(vm: *const Vm, arg: u4) [*:0]const u8 {
+    pub fn getArgString(vm: *const Vm, arg: u4) [:0]const u8 {
+        assert(arg < 8);
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
+    }
+
+    pub fn setReturnValueVector(vm: *Vm, vec: [3]f32) void {
+        for (0..3) |i| vm.globals[@intFromEnum(Offset.@"return") + i] = @bitCast(vec[i]);
+    }
+    pub fn setReturnValueEntityIndex(vm: *Vm, entity: u32) void {
+        vm.globals[@intFromEnum(Offset.@"return")] = entity;
+    }
+    pub fn setReturnValueFloat(vm: *Vm, float: f32) void {
+        vm.globals[@intFromEnum(Offset.@"return")] = @bitCast(float);
+    }
+    /// Copies the string into temporary_strings_buffer.
+    pub fn setReturnValueString(vm: *Vm, string: []const u8) void {
+        if (string.len > vm.temporary_strings_buffer.len) @panic("OOM"); // @Cleanup
+        // @Todo ensure temp string allocation is compatible with vanilla Quake
+        // @Todo we could be more clever about how temp strings are allocated,
+        // like using a bump allocator, or a circular buffer of fixed size strings,
+        // but for now just overwrite with the latest returned string.
+        @memcpy(vm.temporary_strings_buffer[0..string.len], string);
+        vm.temporary_strings_buffer[string.len] = 0;
+        vm.setReturnValueManuallyFilledTempString(0);
+    }
+
+    /// Call this function if you have manually written to the
+    /// temporary_strings_buffer, otherwise call setReturnValueString.
+    pub fn setReturnValueManuallyFilledTempString(vm: *Vm, start_idx: u31) void {
+        vm.temporary_strings_buffer[vm.temporary_strings_buffer.len] = 0; // maintain sentinel, just in case!
+        vm.globals[@intFromEnum(Offset.@"return")] =
+            @bitCast(@as(i32, -1) - start_idx);
     }
 
     /// Returns a string from either the global or temporary strings buffer
@@ -322,8 +358,8 @@ pub const Vm = struct {
     fn getString(vm: *const Vm, offset: i32) [:0]const u8 {
         if (offset < 0) {
             // temp string
-            var idx: u32 = @intCast(-offset);
-            if (idx >= vm.temporary_strings_buffer.len) idx = 0;
+            const idx: u32 = @intCast(-offset - 1);
+            if (idx >= vm.temporary_strings_buffer.len) return vm.getString(0);
             return subCString(vm.temporary_strings_buffer, idx);
         } else {
             // global string
@@ -398,7 +434,6 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
     // @Todo add some sort of configure phase to the API where the user can
     // supply values to fulfill this contract.
     assert(vm.entity_memory.len == vm.num_entities * vm.num_entity_fields);
-    assert(vm.temporary_strings_buffer.len > 0);
 
     // find function by name
     const func_idx: u32 = for (vm.funcs, 0..) |func, i| {
