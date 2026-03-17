@@ -224,9 +224,20 @@ pub const Vm = struct {
 
     num_entity_fields: u32,
 
+    ///////////////////////////////////////////////////////////////////
+    // The following fields should be set by the user before execution.
+
     /// User supplied builtin functions
     builtins: []const BuiltinFn,
 
+    // Entities are stored in a seperate memory region that the user supplies.
+    // The size of this memory region must be at least
+    // num_entities * num_entity_fields * @sizeOf(u32) bytes.
+    // Currently we store all entities contiguously as an array of fields (u32s),
+    // but this may change in the future if we allow users to define their own
+    // data layout for entities.
+
+    // @Todo at least 1 entity must be allocated so accessing the null entity will always work
     /// User supplied entities
     entity_memory: []u32,
     num_entities: u32,
@@ -234,13 +245,15 @@ pub const Vm = struct {
     /// User supplied string buffer
     temporary_strings_buffer: [:0]u8,
 
-    // runtime fields
+    ///////////////////////////////////////////////////
+    // The following fields are managed by the runtime.
+
     /// The number of arguments passed to a builtin function
     argc: u4,
 
     call_stack: [MAX_STACK_DEPTH]struct {
-        stmt: u32,
-        func: *const Function, // @Cleanup store function index instead
+        stmt: u32, // index into statements
+        func: u32, // index into functions
     },
     call_stack_depth: u32, // std.math.IntFittingRange(0, MAX_STACK_DEPTH) ?
 
@@ -248,13 +261,43 @@ pub const Vm = struct {
     local_stack_used: u32, // std.math.IntFittingRange(0, LOCALSTACK_SIZE) ?
 
     trace: bool,
-    current_function: *const Function,
+    current_function: u32,
     program_counter: u32,
 
     const MAX_STACK_DEPTH = 32;
     const LOCALSTACK_SIZE = 2048;
 
     pub const BuiltinFn = *const fn (*Vm) void;
+
+    pub const blank: Vm = .{
+        .version = 0,
+        .progdefs_crc = 0,
+        .program_crc = 0,
+
+        .program = &.{},
+        .strings = &.{},
+        .funcs = &.{},
+        .globaldefs = &.{},
+        .fielddefs = &.{},
+        .statements = &.{},
+        .globals = &.{},
+
+        .argc = 0,
+        .builtins = &.{},
+
+        .entity_memory = &.{},
+        .num_entities = 0,
+        .num_entity_fields = 0,
+        .temporary_strings_buffer = @constCast(&.{}),
+
+        .trace = false,
+        .call_stack = @splat(.{ .stmt = 0, .func = 0 }),
+        .call_stack_depth = 0,
+        .local_stack = @splat(0),
+        .local_stack_used = 0,
+        .current_function = 0,
+        .program_counter = 0,
+    };
 
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         const offset = @intFromEnum(Offset.parm0) + arg * 3;
@@ -291,7 +334,7 @@ pub const Vm = struct {
     }
 };
 
-pub fn loadProgram(bytes: []u8, check_progdefs_crc: bool) !Vm {
+pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) !void {
     var progs_crc = crc.init;
     for (bytes) |b| crc.processByte(&progs_crc, b);
 
@@ -336,35 +379,19 @@ pub fn loadProgram(bytes: []u8, check_progdefs_crc: bool) !Vm {
         std.mem.byteSwapAllElements(u32, globals);
     }
 
-    return .{
-        .version = hdr.version,
-        .progdefs_crc = @intCast(hdr.crc),
-        .program_crc = progs_crc,
+    vm.version = hdr.version;
+    vm.progdefs_crc = @intCast(hdr.crc);
+    vm.program_crc = progs_crc;
 
-        .program = bytes,
-        .strings = strings,
-        .funcs = funcs,
-        .globaldefs = globaldefs,
-        .fielddefs = fielddefs,
-        .statements = statements,
-        .globals = globals,
+    vm.program = bytes;
+    vm.strings = strings;
+    vm.funcs = funcs;
+    vm.globaldefs = globaldefs;
+    vm.fielddefs = fielddefs;
+    vm.statements = statements;
+    vm.globals = globals;
 
-        .argc = 0,
-        .builtins = &.{},
-
-        .entity_memory = &.{},
-        .num_entities = 0,
-        .num_entity_fields = hdr.entityfields,
-        .temporary_strings_buffer = @constCast(&.{}),
-
-        .trace = false,
-        .call_stack = undefined,
-        .call_stack_depth = 0,
-        .local_stack = undefined,
-        .local_stack_used = 0,
-        .current_function = undefined,
-        .program_counter = 0,
-    };
+    vm.num_entity_fields = hdr.entityfields;
 }
 
 pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
@@ -374,9 +401,9 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
     assert(vm.temporary_strings_buffer.len > 0);
 
     // find function by name
-    const func: *const Function = for (vm.funcs) |*func| {
+    const func_idx: u32 = for (vm.funcs, 0..) |func, i| {
         const name = subCString(vm.strings, func.s_name);
-        if (std.mem.eql(u8, name, func_name)) break func;
+        if (std.mem.eql(u8, name, func_name)) break @intCast(i);
     } else {
         std.log.err("could not find function '{s}'", .{func_name});
         std.process.exit(1);
@@ -387,7 +414,7 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
     const exit_depth = vm.call_stack_depth;
     var runaway: u32 = 100_000;
 
-    enterVmFunction(vm, func);
+    enterVmFunction(vm, func_idx);
     run_loop: while (true) {
         const stmt = vm.statements[vm.program_counter];
 
@@ -558,7 +585,7 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
                     vm.argc = num_args;
                     vm.builtins[builtin_id](vm);
                 } else {
-                    enterVmFunction(vm, next_func);
+                    enterVmFunction(vm, a.function);
                     continue; // don't increment counter
                 }
             },
@@ -585,21 +612,19 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
 }
 
 /// Sets up the program counter and local/call stacks
-fn enterVmFunction(vm: *Vm, func: *const Function) void {
+fn enterVmFunction(vm: *Vm, func_idx: u32) void {
+    const func = vm.funcs[func_idx];
     assert(func.first_statement < vm.statements.len);
     assert(func.first_statement > 0);
 
-    vm.call_stack[vm.call_stack_depth] = if (vm.call_stack_depth == 0)
-        // @Cleanup should the first callstack entry be a null value instead?
-        .{
-            .stmt = @intCast(func.first_statement),
-            .func = func,
-        }
-    else
-        .{
-            .stmt = vm.program_counter,
-            .func = vm.current_function,
-        };
+    if (vm.call_stack_depth == 0) {
+        assert(vm.program_counter == 0);
+        assert(vm.current_function == 0);
+    }
+    vm.call_stack[vm.call_stack_depth] = .{
+        .stmt = vm.program_counter,
+        .func = vm.current_function,
+    };
 
     vm.call_stack_depth += 1;
     if (vm.call_stack_depth >= vm.call_stack.len)
@@ -617,15 +642,15 @@ fn enterVmFunction(vm: *Vm, func: *const Function) void {
     vm.local_stack_used += func.locals;
 
     // copy parameters into global registers
-    var o = func.parm_start;
+    var reg = func.parm_start;
     for (0..func.numparms) |i| {
         for (0..func.parm_sizes[i]) |j| {
-            vm.globals[o] = vm.globals[@intFromEnum(Offset.parm0) + i * 3 + j];
-            o += 1;
+            vm.globals[reg] = vm.globals[@intFromEnum(Offset.parm0) + i * 3 + j];
+            reg += 1;
         }
     }
 
-    vm.current_function = func;
+    vm.current_function = func_idx;
     vm.program_counter = @intCast(func.first_statement);
 }
 
@@ -633,13 +658,15 @@ fn leaveVmFunction(vm: *Vm) void {
     if (vm.call_stack_depth == 0)
         @panic("call stack underflow");
 
+    const current_func = vm.funcs[vm.current_function];
+
     // restore locals from the local stack
-    const num_locals = vm.current_function.locals;
+    const num_locals = current_func.locals;
     if (num_locals > vm.local_stack_used) @panic("local stack underflow");
     vm.local_stack_used -= num_locals;
 
     @memcpy(
-        vm.globals[vm.current_function.parm_start..][0..num_locals],
+        vm.globals[current_func.parm_start..][0..num_locals],
         vm.local_stack[vm.local_stack_used..][0..num_locals],
     );
 

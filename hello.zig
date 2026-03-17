@@ -13,12 +13,12 @@ pub fn main() !void {
     const verbose = if (args.next()) |arg| std.mem.eql(u8, arg, "-v") else false;
     const prog_data = try std.fs.cwd().readFileAlloc(arena, file_path, 64 * 1024 * 1024);
 
-    var qcvm = try quakec.loadProgram(prog_data, false);
+    var qcvm: quakec.Vm = .blank;
+    try quakec.loadProgram(&qcvm, prog_data, false);
 
-    const max_entities = 32;
+    qcvm.num_entities = 32;
+    qcvm.entity_memory = try arena.alloc(u32, qcvm.num_entities * qcvm.num_entity_fields);
     qcvm.temporary_strings_buffer = try arena.allocSentinel(u8, 1024, 0);
-    qcvm.entity_memory = try arena.alloc(u32, max_entities * qcvm.num_entity_fields);
-    qcvm.num_entities = max_entities;
     qcvm.builtins = &.{
         vmSpawn,
         vmPrintf,
