@@ -409,8 +409,6 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
         std.process.exit(1);
     };
 
-    var buf: [1024]u8 = undefined;
-
     const exit_depth = vm.call_stack_depth;
     var runaway: u32 = 100_000;
 
@@ -422,7 +420,7 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
         if (runaway == 0) @panic("runaway loop");
 
         if (verbose_statements)
-            std.log.debug("{s}", .{printStatement(&buf, vm.*, stmt) catch @panic("OOM")});
+            std.log.debug("{f}", .{printStatement(vm, stmt)});
 
         const GlobalValue = extern union {
             float: f32,
@@ -691,98 +689,97 @@ fn getDefAtOffset(defs: []const Def, offset: u32) ?*const Def {
     } else null;
 }
 
-fn printGlobal(w: *std.Io.Writer, vm: Vm, offset: u32) !void {
+fn printStatement(vm: *const Vm, stmt: Statement) struct {
+    vm: *const Vm,
+    stmt: Statement,
+    pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+        // @Todo better printing format, this is butt ugly
+        switch (self.stmt.op) {
+            else => |op| try w.print("{t: <10} ", .{op}),
+            _ => |op| {
+                return w.print("invalid opcode: {d}", .{@intFromEnum(op)});
+            },
+        }
+
+        switch (self.stmt.op) {
+            .@"if", .ifnot => {
+                try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
+                try w.print("branch {d}", .{self.stmt.args[1]});
+            },
+            .goto => {
+                try w.print("branch {d}", .{self.stmt.args[1]});
+            },
+            .store_f,
+            .store_v,
+            .store_s,
+            .store_ent,
+            .store_fld,
+            .store_fnc,
+            => {
+                try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
+                try printGlobal(w, self.vm, @intCast(self.stmt.args[1]), false);
+            },
+            else => {
+                if (self.stmt.args[0] != 0)
+                    try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
+                if (self.stmt.args[1] != 0)
+                    try printGlobal(w, self.vm, @intCast(self.stmt.args[1]), true);
+                if (self.stmt.args[2] != 0)
+                    try printGlobal(w, self.vm, @intCast(self.stmt.args[2]), false);
+            },
+            _ => unreachable,
+        }
+    }
+} {
+    return .{ .vm = vm, .stmt = stmt };
+}
+
+fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_contents: bool) !void {
     assert(@as(i32, @bitCast(offset)) > 0);
-    const start = w.end;
-    if (getDefAtOffset(vm.globaldefs, offset)) |global_def| {
-        try w.print("{d}({s})", .{ offset, vm.strings[global_def.s_name.. :0].ptr });
+    var alignment_buf: [128]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&alignment_buf); // sub writer
+
+    if (getDefAtOffset(vm.globaldefs, offset)) |global_def| print_def: {
+        try sw.print("{d}({s})", .{ offset, vm.strings[global_def.s_name.. :0].ptr });
+        if (!print_contents) break :print_def;
+
         // PR_ValueString
         const value = vm.globals[offset];
         switch (global_def.type.tag) {
-            .void => try w.writeAll("void"),
+            .void => try sw.writeAll("void"),
             .string => {
                 const str = vm.getString(@bitCast(value));
-                try w.print("\"{f}\" ", .{std.ascii.hexEscape(str, .lower)});
+                var str_buf: [9]u8 = undefined;
+                var str_writer: std.Io.Writer = .fixed(&str_buf);
+                str_writer.print("{f}", .{std.ascii.hexEscape(str, .lower)}) catch {
+                    str_buf[str_buf.len - 3 ..].* = @splat('.'); // truncate string
+                };
+                try sw.print("\"{s}\"", .{str_writer.buffered()});
             },
-            .float => try w.printFloat(@as(f32, @bitCast(value)), .{}),
-            .vector => try w.print("{d}, {d}, {d}", .{
+            .float => try sw.printFloat(@as(f32, @bitCast(value)), .{}),
+            .vector => try sw.print("{d}, {d}, {d}", .{
                 @as(f32, @bitCast(vm.globals[offset + 0])),
                 @as(f32, @bitCast(vm.globals[offset + 1])),
                 @as(f32, @bitCast(vm.globals[offset + 2])),
             }),
-            .entity => try w.print("entity {d}", .{value}),
+            .entity => try sw.print("entity {d}", .{value}),
             .field => {
                 const field_def = getDefAtOffset(vm.fielddefs, value);
                 const field_str_offset = if (field_def) |d| d.s_name else 0;
-                try w.print(".{s}", .{vm.getString(@bitCast(field_str_offset))});
+                try sw.print(".{s}", .{vm.getString(@bitCast(field_str_offset))});
             },
             .function => {
                 const func = vm.funcs[value];
-                try w.print("{s}()", .{vm.getString(@bitCast(func.s_name))});
+                try sw.print("{s}()", .{vm.getString(@bitCast(func.s_name))});
             },
-            .pointer => try w.writeAll("pointer"),
-            _ => |t| try w.print("bad type {d}", .{@intFromEnum(t)}),
+            .pointer => try sw.writeAll("pointer"),
+            _ => |t| try sw.print("bad type {d}", .{@intFromEnum(t)}),
         }
     } else {
-        try w.print("{d}(???)", .{offset});
+        try sw.print("{d}(???)", .{offset});
     }
 
-    try w.splatByteAll(' ', 25 -| (w.end - start)); // pad with 25 spaces
-}
-
-fn printGlobalNoContents(w: *std.Io.Writer, vm: Vm, offset: u32) !void {
-    assert(@as(i32, @bitCast(offset)) > 0);
-    const start = w.end;
-
-    if (getDefAtOffset(vm.globaldefs, offset)) |def| {
-        try w.print("{d}({s})", .{ offset, vm.strings[def.s_name.. :0].ptr });
-    } else {
-        try w.print("{d}(???)", .{offset});
-    }
-
-    try w.splatByteAll(' ', 25 -| (w.end - start)); // pad with 25 spaces
-}
-
-// @Todo better printing format, this is butt ugly
-fn printStatement(buf: []u8, vm: Vm, stmt: Statement) ![]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    switch (stmt.op) {
-        else => |op| try w.print("{t: <10} ", .{op}),
-        _ => |op| {
-            try w.print("invalid opcode: {d}", .{@intFromEnum(op)});
-            return w.buffered();
-        },
-    }
-
-    switch (stmt.op) {
-        .@"if", .ifnot => {
-            try printGlobal(&w, vm, @intCast(stmt.args[0]));
-            try w.print("branch {d}", .{stmt.args[1]});
-        },
-        .goto => {
-            try w.print("branch {d}", .{stmt.args[1]});
-        },
-        .store_f,
-        .store_v,
-        .store_s,
-        .store_ent,
-        .store_fld,
-        .store_fnc,
-        => {
-            try printGlobal(&w, vm, @intCast(stmt.args[0]));
-            try printGlobalNoContents(&w, vm, @intCast(stmt.args[1]));
-        },
-        else => {
-            if (stmt.args[0] != 0)
-                try printGlobal(&w, vm, @intCast(stmt.args[0]));
-            if (stmt.args[1] != 0)
-                try printGlobal(&w, vm, @intCast(stmt.args[1]));
-            if (stmt.args[2] != 0)
-                try printGlobalNoContents(&w, vm, @intCast(stmt.args[2]));
-        },
-        _ => unreachable,
-    }
-    return w.buffered();
+    try writer.alignBuffer(sw.buffered(), 25, .left, ' ');
 }
 
 fn dumpVm(vm: Vm) void {
