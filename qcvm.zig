@@ -205,6 +205,8 @@ const crc = @import("crc.zig");
 const assert = std.debug.assert;
 const native_endian = @import("builtin").cpu.arch.endian();
 
+pub const BuiltinFn = *const fn (*Vm) void;
+
 pub const Vm = struct {
     version: u32,
     /// checksum of progsdefs header file
@@ -245,6 +247,15 @@ pub const Vm = struct {
     /// User supplied string buffer
     temporary_strings_buffer: [:0]u8,
 
+    /// User supplied logger callback. The vm will call this function when
+    /// panicking or to log diagnostic information. The default handler prints to
+    /// stderr, but you can replace it with your own, or set it to null to disable
+    /// logging entirely.
+    logger: ?LoggerCallbackFn,
+
+    /// Enable logging of statements as they are executed
+    trace: bool,
+
     ///////////////////////////////////////////////////////////////////////////
     // The following fields are managed by the runtime.
 
@@ -260,14 +271,11 @@ pub const Vm = struct {
     local_stack: [LOCALSTACK_SIZE]u32,
     local_stack_used: u32, // std.math.IntFittingRange(0, LOCALSTACK_SIZE) ?
 
-    trace: bool,
     current_function: u32,
     program_counter: u32,
 
     const MAX_STACK_DEPTH = 32;
     const LOCALSTACK_SIZE = 2048;
-
-    pub const BuiltinFn = *const fn (*Vm) void;
 
     pub const blank: Vm = .{
         .version = 0,
@@ -291,6 +299,8 @@ pub const Vm = struct {
         .temporary_strings_buffer = @constCast(&.{}),
 
         .trace = false,
+        .logger = defaultLogger,
+
         .call_stack = @splat(.{ .stmt = 0, .func = 0 }),
         .call_stack_depth = 0,
         .local_stack = @splat(0),
@@ -379,9 +389,53 @@ pub const Vm = struct {
             return subCString(vm.strings, idx);
         }
     }
+
+    pub fn panic(vm: *Vm, msg: []const u8) ExecError {
+        if (vm.logger) |logger| logger(vm, .{ .panic = msg });
+        return error.VmPanic;
+    }
+
+    pub fn panicExtra(vm: *Vm, comptime fmt: []const u8, args: anytype) ExecError {
+        if (vm.logger) |logger| {
+            var buf: [256]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+
+            w.print(fmt, args) catch {
+                const truncated = "...(msg truncated)";
+                @memcpy(buf[buf.len - truncated.len ..], truncated);
+            };
+            logger(vm, .{ .panic = w.buffered() });
+        }
+        return error.VmPanic;
+    }
 };
 
-pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) !void {
+pub const LoggerCallbackFn = *const fn (vm: *Vm, mode: LoggerMode) void;
+pub const LoggerMode = union(enum) {
+    panic: []const u8, // reason
+    statement: Statement,
+};
+
+/// Log to stderr.
+pub fn defaultLogger(vm: *Vm, mode: LoggerMode) void {
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderrWriter(&buffer);
+    defer std.debug.unlockStderrWriter();
+
+    nosuspend switch (mode) {
+        .panic => |msg| {
+            stderr.print("panic: {s}\n", .{msg}) catch {};
+            printStackTrace(stderr, vm) catch {};
+        },
+        .statement => |stmt| {
+            printStatement(stderr, vm, stmt) catch {};
+        },
+    };
+}
+
+pub const LoadProgramError = error{ WrongVersion, InvalidChecksum };
+
+pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) LoadProgramError!void {
     var progs_crc = crc.init;
     for (bytes) |b| crc.processByte(&progs_crc, b);
 
@@ -406,8 +460,6 @@ pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) !void {
         );
         return error.InvalidChecksum;
     }
-
-    // std.log.debug("header = {f}", .{prettyFmtStruct(hdr)});
 
     // zig fmt: off
     const strings:    [:0]u8      =                     bytes[hdr.ofs_strings   ..][0..hdr.size_strings                       :0];
@@ -441,32 +493,36 @@ pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) !void {
     vm.num_entity_fields = hdr.entityfields;
 }
 
-pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
+pub const ExecError = error{ FunctionNotFound, VmPanic };
+
+pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     // @Todo add some sort of configure phase to the API where the user can
     // supply values to fulfill this contract.
     assert(vm.entity_memory.len == vm.num_entities * vm.num_entity_fields);
+    assert(vm.num_entities >= 1); // at least the null entity needs to exist
 
     // find function by name
     const func_idx: u32 = for (vm.funcs, 0..) |func, i| {
         const name = subCString(vm.strings, func.s_name);
         if (std.mem.eql(u8, name, func_name)) break @intCast(i);
     } else {
-        std.log.err("could not find function '{s}'", .{func_name});
-        std.process.exit(1);
+        return error.FunctionNotFound;
     };
 
     const exit_depth = vm.call_stack_depth;
     var runaway: u32 = 100_000;
 
-    enterVmFunction(vm, func_idx);
+    try enterVmFunction(vm, func_idx);
     run_loop: while (true) {
         const stmt = vm.statements[vm.program_counter];
 
         runaway -= 1;
-        if (runaway == 0) @panic("runaway loop");
+        if (runaway == 0) return vm.panic(
+            "runaway loop; vm exceeded maximum cycle count without yielding",
+        );
 
-        if (verbose_statements)
-            std.log.debug("{f}", .{printStatement(vm, stmt)});
+        if (vm.trace and vm.logger != null)
+            vm.logger.?(vm, .{ .statement = stmt });
 
         const GlobalValue = extern union {
             float: f32,
@@ -480,7 +536,7 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
         };
 
         // Global registers accessed by statement arguments
-        // @Todo bounds checking for vectors
+        // @Todo bounds checking for vectors, indices, etc. We should not trust user input!
         const a: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[0])]);
         const b: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[1])]);
         const c: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
@@ -618,18 +674,18 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
             => |call| {
                 const num_args: u4 = @intCast(@intFromEnum(call) - @intFromEnum(Opcode.call0));
 
-                if (a.function == 0) @panic("null function");
+                if (a.function == 0) return vm.panic("attempted to call null function");
                 const next_func = &vm.funcs[a.function];
 
                 if (next_func.first_statement < 0) {
                     const builtin_id: u32 = @intCast(-next_func.first_statement - 1);
                     if (builtin_id >= vm.builtins.len) {
-                        std.debug.panic("unimplemented builtin: {d}", .{builtin_id + 1});
+                        return vm.panicExtra("unimplemented builtin: {d}", .{builtin_id + 1});
                     }
                     vm.argc = num_args;
                     vm.builtins[builtin_id](vm);
                 } else {
-                    enterVmFunction(vm, a.function);
+                    try enterVmFunction(vm, a.function);
                     continue; // don't increment counter
                 }
             },
@@ -639,16 +695,16 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
                     vm.globals[@intFromEnum(Offset.@"return")..][0..3],
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
-                leaveVmFunction(vm);
+                try leaveVmFunction(vm);
                 if (op == .done or exit_depth == vm.call_stack_depth)
                     break :run_loop; // all done
             },
 
             .state => {
-                @panic("unimplemented opcode: state");
+                return vm.panic("unimplemented opcode: state"); // @Incomplete
             },
 
-            _ => |op| std.debug.panic("invalid opcode: {d}", .{@intFromEnum(op)}),
+            _ => |op| return vm.panicExtra("invalid opcode: {d}", .{@intFromEnum(op)}),
         }
 
         vm.program_counter +%= 1;
@@ -656,7 +712,7 @@ pub fn exec(vm: *Vm, func_name: []const u8, verbose_statements: bool) void {
 }
 
 /// Sets up the program counter and local/call stacks
-fn enterVmFunction(vm: *Vm, func_idx: u32) void {
+fn enterVmFunction(vm: *Vm, func_idx: u32) ExecError!void {
     const func = vm.funcs[func_idx];
     assert(func.first_statement < vm.statements.len);
     assert(func.first_statement > 0);
@@ -672,13 +728,13 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) void {
 
     vm.call_stack_depth += 1;
     if (vm.call_stack_depth >= vm.call_stack.len)
-        @panic("call stack overflow"); // @Todo stack trace
+        return vm.panic("call stack overflow");
 
     // Save any locals the new function would overwrite.
     // This can cause redundant copies in the pathological case,
     // but is otherwise necessary.
     if (vm.local_stack_used + func.locals > vm.local_stack.len)
-        @panic("local stack overflow"); // @Todo stack trace
+        return vm.panic("local stack overflow");
     @memcpy(
         vm.local_stack[vm.local_stack_used..][0..func.locals],
         vm.globals[func.parm_start..][0..func.locals],
@@ -698,15 +754,15 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) void {
     vm.program_counter = @intCast(func.first_statement);
 }
 
-fn leaveVmFunction(vm: *Vm) void {
+fn leaveVmFunction(vm: *Vm) ExecError!void {
     if (vm.call_stack_depth == 0)
-        @panic("call stack underflow");
+        return vm.panic("call stack underflow");
 
     const current_func = vm.funcs[vm.current_function];
 
     // restore locals from the local stack
     const num_locals = current_func.locals;
-    if (num_locals > vm.local_stack_used) @panic("local stack underflow");
+    if (num_locals > vm.local_stack_used) return vm.panic("local stack underflow");
     vm.local_stack_used -= num_locals;
 
     @memcpy(
@@ -718,6 +774,39 @@ fn leaveVmFunction(vm: *Vm) void {
     vm.call_stack_depth -= 1;
     vm.current_function = vm.call_stack[vm.call_stack_depth].func;
     vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
+}
+
+pub fn printStackTrace(w: *std.Io.Writer, vm: *Vm) std.Io.Writer.Error!void {
+    if (vm.call_stack_depth == 0)
+        return w.writeAll("<NO CALL STACK>\n");
+
+    // @Performance the mutability of vm here is viral and affects the public API (logging and panics).
+    // For the sake of better codegen, maybe it's worth changing the logic here to let vm be const? I dunno.
+
+    // temporarily push the current call frame so the loop below can be simpler
+    const temp_frame = vm.call_stack[vm.call_stack_depth]; // this should always be empty but just copy it anyway
+    vm.call_stack[vm.call_stack_depth] = .{
+        .func = vm.current_function,
+        .stmt = vm.program_counter,
+    };
+    defer vm.call_stack[vm.call_stack_depth] = temp_frame;
+
+    var i: u32 = vm.call_stack_depth;
+    while (true) : (i -= 1) {
+        if (vm.call_stack[i].func == 0) {
+            try w.writeAll("???: stmt 0 in ???\n");
+        } else {
+            // @Todo parse fteqcc line info and print the correct line of source code
+            const func = vm.funcs[vm.call_stack[i].func];
+            try w.print("{s}: stmt {d} in {s}\n", .{
+                vm.getString(@bitCast(func.s_file)),
+                vm.call_stack[i].stmt,
+                vm.getString(@bitCast(func.s_name)),
+            });
+        }
+
+        if (i == 0) break;
+    }
 }
 
 inline fn floatFromBool(b: bool) f32 {
@@ -735,49 +824,43 @@ fn getDefAtOffset(defs: []const Def, offset: u32) ?*const Def {
     } else null;
 }
 
-fn printStatement(vm: *const Vm, stmt: Statement) struct {
-    vm: *const Vm,
-    stmt: Statement,
-    pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
-        // @Todo better printing format, this is butt ugly
-        switch (self.stmt.op) {
-            else => |op| try w.print("{t: <10} ", .{op}),
-            _ => |op| {
-                return w.print("invalid opcode: {d}", .{@intFromEnum(op)});
-            },
-        }
-
-        switch (self.stmt.op) {
-            .@"if", .ifnot => {
-                try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
-                try w.print("branch {d}", .{self.stmt.args[1]});
-            },
-            .goto => {
-                try w.print("branch {d}", .{self.stmt.args[1]});
-            },
-            .store_f,
-            .store_v,
-            .store_s,
-            .store_ent,
-            .store_fld,
-            .store_fnc,
-            => {
-                try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
-                try printGlobal(w, self.vm, @intCast(self.stmt.args[1]), false);
-            },
-            else => {
-                if (self.stmt.args[0] != 0)
-                    try printGlobal(w, self.vm, @intCast(self.stmt.args[0]), true);
-                if (self.stmt.args[1] != 0)
-                    try printGlobal(w, self.vm, @intCast(self.stmt.args[1]), true);
-                if (self.stmt.args[2] != 0)
-                    try printGlobal(w, self.vm, @intCast(self.stmt.args[2]), false);
-            },
-            _ => unreachable,
-        }
+pub fn printStatement(w: *std.Io.Writer, vm: *const Vm, stmt: Statement) std.Io.Writer.Error!void {
+    // @Todo better printing format, this is butt ugly
+    switch (stmt.op) {
+        else => |op| try w.print("{t: <10} ", .{op}),
+        _ => |op| {
+            return w.print("invalid opcode: {d}", .{@intFromEnum(op)});
+        },
     }
-} {
-    return .{ .vm = vm, .stmt = stmt };
+
+    switch (stmt.op) {
+        .@"if", .ifnot => {
+            try printGlobal(w, vm, @intCast(stmt.args[0]), true);
+            try w.print("branch {d}", .{stmt.args[1]});
+        },
+        .goto => {
+            try w.print("branch {d}", .{stmt.args[1]});
+        },
+        .store_f,
+        .store_v,
+        .store_s,
+        .store_ent,
+        .store_fld,
+        .store_fnc,
+        => {
+            try printGlobal(w, vm, @intCast(stmt.args[0]), true);
+            try printGlobal(w, vm, @intCast(stmt.args[1]), false);
+        },
+        else => {
+            if (stmt.args[0] != 0)
+                try printGlobal(w, vm, @intCast(stmt.args[0]), true);
+            if (stmt.args[1] != 0)
+                try printGlobal(w, vm, @intCast(stmt.args[1]), true);
+            if (stmt.args[2] != 0)
+                try printGlobal(w, vm, @intCast(stmt.args[2]), false);
+        },
+        _ => unreachable,
+    }
 }
 
 fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_contents: bool) !void {
@@ -828,48 +911,42 @@ fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_content
     try writer.alignBuffer(sw.buffered(), 25, .left, ' ');
 }
 
-fn dumpVm(vm: Vm) void {
-    const PrettyFunc = struct {
-        func: Function,
-        strings: [:0]u8,
-
-        pub fn format(
-            self: @This(),
-            w: *std.Io.Writer,
-        ) std.Io.Writer.Error!void {
-            if (self.func.first_statement == 0) {
-                return w.writeAll("fn null");
-            }
-
-            try w.print("{s}.{s}:", .{
-                @as([*:0]const u8, @ptrCast(&self.strings[self.func.s_file])),
-                @as([*:0]const u8, @ptrCast(&self.strings[self.func.s_name])),
-            });
-
-            if (self.func.first_statement < 0) {
-                try w.print(" builtin={d}", .{-self.func.first_statement});
-            } else {
-                try w.print(" entry=0x{X}", .{self.func.first_statement});
-            }
-
-            try w.print(", #params={d}, #locals={d}", .{
-                self.func.numparms,
-                self.func.locals,
-            });
-        }
-    };
-
+// @Cleanup is this even worth keeping?
+pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (vm.funcs, 0..) |func, i| {
-        std.log.debug("fn[{d}] {f}", .{ i, PrettyFunc{ .func = func, .strings = vm.strings } });
+        try w.print("fn[{d}]", .{i});
+
+        if (func.first_statement == 0) {
+            try w.writeAll(" fn null\n");
+            continue;
+        }
+
+        try w.print(" {s}.{s}:", .{
+            vm.getString(@bitCast(func.s_file)),
+            vm.getString(@bitCast(func.s_name)),
+        });
+
+        if (func.first_statement < 0) {
+            try w.print(" builtin={d}", .{-func.first_statement});
+        } else {
+            try w.print(" entry=0x{X}", .{func.first_statement});
+        }
+
+        try w.print(", #params={d}, #locals={d}", .{
+            func.numparms,
+            func.locals,
+        });
+
+        try w.writeByte('\n');
     }
 
     for (vm.globaldefs, 0..) |def, i| {
         if (def.offset == 0)
-            std.log.debug("globaldef[{d}] null", .{i})
+            try w.print("globaldef[{d}] null\n", .{i})
         else
-            std.log.debug("globaldef[{d}] {s}: type={t}, offset=0x{X}, save={}", .{
+            try w.print("globaldef[{d}] {s}: type={t}, offset=0x{X}, save={}\n", .{
                 i,
-                @as([*:0]const u8, @ptrCast(&vm.strings[def.s_name])),
+                vm.getString(@bitCast(def.s_name)),
                 def.type.tag,
                 def.offset,
                 def.type.save_global,
@@ -878,27 +955,19 @@ fn dumpVm(vm: Vm) void {
 
     for (vm.fielddefs, 0..) |def, i| {
         if (def.offset == 0)
-            std.log.debug("fielddef[{d}] null", .{i})
+            try w.print("fielddef[{d}] null\n", .{i})
         else
-            std.log.debug("fielddef[{d}] {s}: type={t}, offset=0x{X}, save={}", .{
+            try w.print("fielddef[{d}] {s}: type={t}, offset=0x{X}, save={}\n", .{
                 i,
-                @as([*:0]const u8, @ptrCast(&vm.strings[def.s_name])),
+                vm.getString(@bitCast(def.s_name)),
                 def.type.tag,
                 def.offset,
                 def.type.save_global,
             });
     }
 
-    const opcode_name_len = comptime blk: {
-        var len: usize = 0;
-        for (@typeInfo(Opcode).@"enum".fields) |field| {
-            len = @max(len, field.name.len);
-        }
-        break :blk std.fmt.comptimePrint("{d}", .{len});
-    };
-
     for (vm.statements, 0..) |stmt, i| {
-        std.log.debug("asm[{d}] {t: >" ++ opcode_name_len ++ "}: a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}", .{
+        try w.print("asm[{d}] {t: >10}: a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
             i,
             stmt.op,
             @as(u16, @bitCast(stmt.args[0])),
@@ -907,27 +976,5 @@ fn dumpVm(vm: Vm) void {
         });
     }
 
-    std.log.debug("globals: {any}", .{vm.globals});
-}
-
-fn prettyFmtStruct(data: anytype) struct {
-    data: @TypeOf(data),
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        const fields = switch (@typeInfo(@TypeOf(data))) {
-            .@"struct" => |info| info.fields,
-            .pointer => |info| @typeInfo(info.child).@"struct".fields,
-            else => unreachable,
-        };
-
-        try writer.writeAll(".{");
-        if (fields.len > 0) try writer.writeByte('\n');
-        inline for (fields) |field| {
-            try writer.writeAll("  ." ++ field.name ++ " = ");
-            try writer.printValue("any", .{}, @field(self.data, field.name), 1);
-            try writer.writeAll(",\n");
-        }
-        try writer.writeByte('}');
-    }
-} {
-    return .{ .data = data };
+    try w.print("globals: {any}\n", .{vm.globals});
 }

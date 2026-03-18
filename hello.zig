@@ -24,7 +24,8 @@ pub fn main() !void {
         vmPrintf,
         vmSprintf,
     };
-    quakec.exec(&qcvm, "main", verbose);
+    qcvm.trace = verbose;
+    try quakec.exec(&qcvm, "main");
 }
 
 // entity spawn() = #1 : spawn;
