@@ -82,6 +82,11 @@ void main()
 
     str = sprintf("%v", [111, 3623.56, 0.124]);
     printf("%s\n", str);
+
+    str = sprintf("0 %f %f %f %f %f %f %f",
+                      1, 2, 3, 4, 5, 6, 7);
+    printf("%s\n", str);
+
 }
 
 entity(float f1, string f2) create = {

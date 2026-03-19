@@ -262,7 +262,8 @@ pub const Vm = struct {
     // The following fields are managed by the runtime. You should not modify
     // them unless you know what you are doing.
 
-    /// The number of arguments passed to a builtin function
+    /// The number of arguments passed to a builtin function.
+    /// Will always be <= 8 when entering a builtin.
     argc: u4,
 
     call_stack: [MAX_STACK_DEPTH]struct {
@@ -319,24 +320,26 @@ pub const Vm = struct {
     ///////////////////////////////////////////////////////////////////////////
     // User builtin function I/O helpers
 
+    // These functions accept a u4 with range checks instead of a u3 because
+    // it reduces casting for the user, especially when iterating up to argc.
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + arg * 3;
+        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
     pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + arg * 3;
+        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + arg * 3;
+        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgString(vm: *const Vm, arg: u4) [:0]const u8 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + arg * 3;
+        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
     }
 
