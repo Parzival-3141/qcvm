@@ -29,35 +29,35 @@ pub fn main() !void {
 }
 
 // entity spawn() = #1 : spawn;
-fn vmSpawn(vm: *quakec.Vm) void {
+fn vmSpawn(vm: *quakec.Vm) quakec.VmError!void {
     const S = struct {
         var active_entities: u32 = 0;
     };
-    if (S.active_entities == vm.num_entities) @panic("exceeded entity limit");
+    if (S.active_entities == vm.num_entities) return vm.panic("exceeded entity limit");
     S.active_entities += 1;
     vm.setReturnValueEntityIndex(S.active_entities);
 }
 
 // void printf(string s, ...) = #2 : printf;
-fn vmPrintf(vm: *quakec.Vm) void {
-    if (vm.argc == 0) @panic("too few arguments");
+fn vmPrintf(vm: *quakec.Vm) quakec.VmError!void {
+    if (vm.argc == 0) return vm.panic("too few arguments");
     const fmt = vm.getArgString(0);
 
     var buf: [256]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
 
-    vmPrintInner(vm, fmt, &stdout.interface) catch @panic("write error");
-    stdout.end() catch @panic("write error");
+    vmPrintInner(vm, fmt, &stdout.interface) catch return vm.panic("write error");
+    stdout.end() catch return vm.panic("write error");
 }
 
 // string sprintf(string s, ...) = #3 : sprintf;
-fn vmSprintf(vm: *quakec.Vm) void {
-    if (vm.argc == 0) @panic("too few arguments");
+fn vmSprintf(vm: *quakec.Vm) quakec.VmError!void {
+    if (vm.argc == 0) return vm.panic("too few arguments");
     const fmt = vm.getArgString(0);
 
     var w: std.Io.Writer = .fixed(vm.temporary_strings_buffer);
 
-    vmPrintInner(vm, fmt, &w) catch @panic("write error");
+    vmPrintInner(vm, fmt, &w) catch return vm.panic("write error");
     w.flush() catch unreachable;
 
     vm.setReturnValueManuallyFilledTempString(0);

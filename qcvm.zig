@@ -205,7 +205,9 @@ const crc = @import("crc.zig");
 const assert = std.debug.assert;
 const native_endian = @import("builtin").cpu.arch.endian();
 
-pub const BuiltinFn = *const fn (*Vm) void;
+pub const VmError = error{Panic};
+
+pub const BuiltinFn = *const fn (*Vm) VmError!void;
 
 pub const Vm = struct {
     version: u32,
@@ -257,7 +259,8 @@ pub const Vm = struct {
     trace: bool,
 
     ///////////////////////////////////////////////////////////////////////////
-    // The following fields are managed by the runtime.
+    // The following fields are managed by the runtime. You should not modify
+    // them unless you know what you are doing.
 
     /// The number of arguments passed to a builtin function
     argc: u4,
@@ -274,6 +277,9 @@ pub const Vm = struct {
     current_function: u32,
     program_counter: u32,
 
+    panicking: bool,
+
+    // @Todo make these configurable
     const MAX_STACK_DEPTH = 32;
     const LOCALSTACK_SIZE = 2048;
 
@@ -301,6 +307,7 @@ pub const Vm = struct {
         .trace = false,
         .logger = defaultLogger,
 
+        .panicking = false,
         .call_stack = @splat(.{ .stmt = 0, .func = 0 }),
         .call_stack_depth = 0,
         .local_stack = @splat(0),
@@ -390,12 +397,14 @@ pub const Vm = struct {
         }
     }
 
-    pub fn panic(vm: *Vm, msg: []const u8) ExecError {
+    pub fn panic(vm: *Vm, msg: []const u8) VmError {
+        vm.panicking = true;
         if (vm.logger) |logger| logger(vm, .{ .panic = msg });
-        return error.VmPanic;
+        return error.Panic;
     }
 
-    pub fn panicExtra(vm: *Vm, comptime fmt: []const u8, args: anytype) ExecError {
+    pub fn panicExtra(vm: *Vm, comptime fmt: []const u8, args: anytype) VmError {
+        vm.panicking = true;
         if (vm.logger) |logger| {
             var buf: [256]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
@@ -406,7 +415,7 @@ pub const Vm = struct {
             };
             logger(vm, .{ .panic = w.buffered() });
         }
-        return error.VmPanic;
+        return error.Panic;
     }
 };
 
@@ -493,7 +502,7 @@ pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) LoadProgramEr
     vm.num_entity_fields = hdr.entityfields;
 }
 
-pub const ExecError = error{ FunctionNotFound, VmPanic };
+pub const ExecError = error{FunctionNotFound} || VmError;
 
 pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     // @Todo add some sort of configure phase to the API where the user can
@@ -508,6 +517,9 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     } else {
         return error.FunctionNotFound;
     };
+
+    vm.panicking = false;
+    errdefer vm.panicking = false;
 
     const exit_depth = vm.call_stack_depth;
     var runaway: u32 = 100_000;
@@ -675,22 +687,39 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                 const num_args: u4 = @intCast(@intFromEnum(call) - @intFromEnum(Opcode.call0));
 
                 if (a.function == 0) return vm.panic("attempted to call null function");
-                const next_func = &vm.funcs[a.function];
+                const next_func = vm.funcs[a.function];
 
                 if (next_func.first_statement < 0) {
-                    const builtin_id: u32 = @intCast(-next_func.first_statement - 1);
-                    if (builtin_id >= vm.builtins.len) {
-                        return vm.panicExtra("unimplemented builtin: {d}", .{builtin_id + 1});
+                    // @Todo start user builtins at index 1 instead of 0, and make 0 the null builtin,
+                    // matching the other values with sentinels
+                    const builtin_idx: u32 = @intCast(-next_func.first_statement - 1);
+                    if (builtin_idx >= vm.builtins.len) {
+                        return vm.panicExtra("unimplemented builtin: {d}", .{builtin_idx + 1});
                     }
                     vm.argc = num_args;
-                    vm.builtins[builtin_id](vm);
+                    // push a call stack frame for the builtin
+                    try pushCallStackFrame(vm, a.function);
+                    vm.builtins[builtin_idx](vm) catch |err| {
+                        // We want panics from builtins to be logged like normal,
+                        // but if the user just returns an error instead of calling panic
+                        // we need to call it for them.
+                        if (!vm.panicking) vm.panicExtra(
+                            "panicked in builtin {s}",
+                            .{vm.getString(@bitCast(next_func.s_name))},
+                        ) catch {}; // ignore this error so it doesn't show up in the error trace
+                        return err;
+                    };
+                    // @Todo should this error? The user could modify the call stack
+                    // such that this would be reachable. Is that a programmer error
+                    // or safety checked behavior?
+                    popCallStackFrame(vm) catch unreachable;
                 } else {
                     try enterVmFunction(vm, a.function);
                     continue; // don't increment counter
                 }
             },
 
-            .done, .@"return" => |op| {
+            inline .done, .@"return" => |op| {
                 if (op == .@"return") @memcpy(
                     vm.globals[@intFromEnum(Offset.@"return")..][0..3],
                     vm.globals[@intCast(stmt.args[0])..][0..3],
@@ -711,11 +740,13 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     }
 }
 
-/// Sets up the program counter and local/call stacks
-fn enterVmFunction(vm: *Vm, func_idx: u32) ExecError!void {
+/// Pushes current_function and program_counter onto the call stack,
+/// and updates them to the new function index and entry respectively.
+/// If func is a builtin then the program_counter will be set to 0.
+fn pushCallStackFrame(vm: *Vm, func_idx: u32) VmError!void {
     const func = vm.funcs[func_idx];
+    const is_builtin = func.first_statement < 0;
     assert(func.first_statement < vm.statements.len);
-    assert(func.first_statement > 0);
 
     if (vm.call_stack_depth == 0) {
         assert(vm.program_counter == 0);
@@ -728,7 +759,37 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) ExecError!void {
 
     vm.call_stack_depth += 1;
     if (vm.call_stack_depth >= vm.call_stack.len)
+        // Technically we lose the last stack frame here. Running this check first
+        // (panicking on the next push) would be more efficient, but then we wouldn't
+        // be able to push another frame in printStackTrace. Also, it's a nice property
+        // for vm.call_stack[vm.call_stack_depth] to never fail.
+        // This matches vanilla Quake behavior.
         return vm.panic("call stack overflow");
+
+    vm.current_function = func_idx;
+    vm.program_counter = if (!is_builtin)
+        @intCast(func.first_statement)
+    else blk: {
+        assert(vm.statements[0].op == .done);
+        break :blk 0;
+    };
+}
+
+fn popCallStackFrame(vm: *Vm) VmError!void {
+    if (vm.call_stack_depth == 0)
+        return vm.panic("call stack underflow");
+
+    vm.call_stack_depth -= 1;
+    vm.current_function = vm.call_stack[vm.call_stack_depth].func;
+    vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
+}
+
+/// Sets up the program counter and local/call stacks.
+/// Passing the null function is allowed.
+fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
+    const func = vm.funcs[func_idx];
+
+    try pushCallStackFrame(vm, func_idx);
 
     // Save any locals the new function would overwrite.
     // This can cause redundant copies in the pathological case,
@@ -749,15 +810,10 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) ExecError!void {
             reg += 1;
         }
     }
-
-    vm.current_function = func_idx;
-    vm.program_counter = @intCast(func.first_statement);
 }
 
-fn leaveVmFunction(vm: *Vm) ExecError!void {
-    if (vm.call_stack_depth == 0)
-        return vm.panic("call stack underflow");
-
+fn leaveVmFunction(vm: *Vm) VmError!void {
+    // It's important we do this before popping the call stack
     const current_func = vm.funcs[vm.current_function];
 
     // restore locals from the local stack
@@ -770,18 +826,16 @@ fn leaveVmFunction(vm: *Vm) ExecError!void {
         vm.local_stack[vm.local_stack_used..][0..num_locals],
     );
 
-    // pop call stack
-    vm.call_stack_depth -= 1;
-    vm.current_function = vm.call_stack[vm.call_stack_depth].func;
-    vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
+    try popCallStackFrame(vm);
 }
 
 pub fn printStackTrace(w: *std.Io.Writer, vm: *Vm) std.Io.Writer.Error!void {
     if (vm.call_stack_depth == 0)
         return w.writeAll("<NO CALL STACK>\n");
 
-    // @Performance the mutability of vm here is viral and affects the public API (logging and panics).
-    // For the sake of better codegen, maybe it's worth changing the logic here to let vm be const? I dunno.
+    // @Performance the mutability of vm here is viral and affects the public API (logging).
+    // For the sake of better codegen, maybe it's worth changing the logic here to let vm be const?
+    // I dunno.
 
     // temporarily push the current call frame so the loop below can be simpler
     const temp_frame = vm.call_stack[vm.call_stack_depth]; // this should always be empty but just copy it anyway
@@ -798,11 +852,19 @@ pub fn printStackTrace(w: *std.Io.Writer, vm: *Vm) std.Io.Writer.Error!void {
         } else {
             // @Todo parse fteqcc line info and print the correct line of source code
             const func = vm.funcs[vm.call_stack[i].func];
-            try w.print("{s}: stmt {d} in {s}\n", .{
-                vm.getString(@bitCast(func.s_file)),
-                vm.call_stack[i].stmt,
-                vm.getString(@bitCast(func.s_name)),
-            });
+            if (func.first_statement < 0) {
+                try w.print("{s}: builtin #{d} {s}\n", .{
+                    vm.getString(@bitCast(func.s_file)),
+                    @as(u32, @intCast(-func.first_statement)),
+                    vm.getString(@bitCast(func.s_name)),
+                });
+            } else {
+                try w.print("{s}: stmt {d} in {s}\n", .{
+                    vm.getString(@bitCast(func.s_file)),
+                    vm.call_stack[i].stmt,
+                    vm.getString(@bitCast(func.s_name)),
+                });
+            }
         }
 
         if (i == 0) break;
@@ -914,14 +976,13 @@ fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_content
 // @Cleanup is this even worth keeping?
 pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (vm.funcs, 0..) |func, i| {
-        try w.print("fn[{d}]", .{i});
-
         if (func.first_statement == 0) {
-            try w.writeAll(" fn null\n");
+            try w.print("function[{d}] null\n", .{i});
             continue;
         }
 
-        try w.print(" {s}.{s}:", .{
+        try w.print("function[{d}] {s}:{s}:", .{
+            i,
             vm.getString(@bitCast(func.s_file)),
             vm.getString(@bitCast(func.s_name)),
         });
@@ -967,7 +1028,7 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
     }
 
     for (vm.statements, 0..) |stmt, i| {
-        try w.print("asm[{d}] {t: >10}: a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
+        try w.print("statement[{d}] {t: >10}: a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
             i,
             stmt.op,
             @as(u16, @bitCast(stmt.args[0])),
