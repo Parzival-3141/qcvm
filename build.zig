@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     run_hello.step.dependOn(b.getInstallStep()); // run from prefix dir
     run_hello.step.dependOn(&b.addInstallBinFile(fteqcc_out, "hello.dat").step);
     run_hello.addFileArg(fteqcc_out);
+    run_hello.addPassthruArgs();
     b.step("run", "Compile and run hello.qc").dependOn(&run_hello.step);
 }
 

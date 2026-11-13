@@ -463,6 +463,7 @@ pub fn defaultLogger(vm: *Vm, mode: LoggerMode) void {
         },
         .statement => |stmt| {
             printStatement(w, vm, stmt) catch {};
+            w.writeByte('\n') catch {};
         },
     };
 }
@@ -732,7 +733,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                             "panicked in builtin {s}",
                             .{vm.getString(@bitCast(next_func.s_name))},
                         ) catch {}; // ignore this error so it doesn't show up in the error trace
-                        return err;
+                        return err; // bubbling up error, ignore me!
                     };
                     // @Todo should this error? The user could modify the call stack
                     // such that this would be reachable. Is that a programmer error
