@@ -277,14 +277,7 @@ pub const Vm = struct {
     /// Will always be <= 8 when entering a builtin.
     argc: u4,
 
-    call_stack: [MAX_STACK_DEPTH]struct {
-        stmt: u32, // index into statements
-        func: u32, // index into functions
-    },
-    call_stack_depth: u32, // std.math.IntFittingRange(0, MAX_STACK_DEPTH) ?
-
-    local_stack: [LOCALSTACK_SIZE]u32,
-    local_stack_used: u32, // std.math.IntFittingRange(0, LOCALSTACK_SIZE) ?
+    stack: CallStack,
 
     current_function: u32,
     program_counter: u32,
@@ -292,8 +285,21 @@ pub const Vm = struct {
     panicking: bool,
 
     // @Todo make these configurable
+    /// Maximum number of functions in the call stack
     const MAX_STACK_DEPTH = 32;
-    const LOCALSTACK_SIZE = 2048;
+    /// Word capacity of the stack
+    const MAX_STACK_SIZE = 2048;
+
+    const CallStack = struct {
+        locals: [MAX_STACK_SIZE]u32,
+        locals_used: u32, // std.math.IntFittingRange(0, MAX_STACK_SIZE) ?
+
+        trace: [MAX_STACK_DEPTH]struct {
+            stmt: u32, // index into statements
+            func: u32, // index into functions
+        },
+        trace_depth: u32, // std.math.IntFittingRange(0, MAX_STACK_DEPTH) ?
+    };
 
     pub const blank: Vm = .{
         .version = 0,
@@ -321,10 +327,13 @@ pub const Vm = struct {
         .logger = defaultLogger,
 
         .panicking = false,
-        .call_stack = @splat(.{ .stmt = 0, .func = 0 }),
-        .call_stack_depth = 0,
-        .local_stack = @splat(0),
-        .local_stack_used = 0,
+
+        .stack = .{
+            .locals = @splat(0),
+            .locals_used = 0,
+            .trace = @splat(.{ .stmt = 0, .func = 0 }),
+            .trace_depth = 0,
+        },
         .current_function = 0,
         .program_counter = 0,
     };
@@ -537,7 +546,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     vm.panicking = false;
     errdefer vm.panicking = false;
 
-    const exit_depth = vm.call_stack_depth;
+    const exit_depth = vm.stack.trace_depth;
     var runaway: u32 = 100_000;
 
     try enterVmFunction(vm, func_idx);
@@ -714,7 +723,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                     }
                     vm.argc = num_args;
                     // push a call stack frame for the builtin
-                    try pushCallStackFrame(vm, a.function);
+                    try pushStackTraceFrame(vm, a.function);
                     vm.builtins[builtin_idx](vm) catch |err| {
                         // We want panics from builtins to be logged like normal,
                         // but if the user just returns an error instead of calling panic
@@ -728,7 +737,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                     // @Todo should this error? The user could modify the call stack
                     // such that this would be reachable. Is that a programmer error
                     // or safety checked behavior?
-                    popCallStackFrame(vm) catch unreachable;
+                    popStackTraceFrame(vm) catch unreachable;
                 } else {
                     try enterVmFunction(vm, a.function);
                     continue; // don't increment counter
@@ -741,7 +750,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
                 try leaveVmFunction(vm);
-                if (op == .done or exit_depth == vm.call_stack_depth)
+                if (op == .done or exit_depth == vm.stack.trace_depth)
                     break :run_loop; // all done
             },
 
@@ -756,29 +765,29 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
     }
 }
 
-/// Pushes current_function and program_counter onto the call stack,
+/// Pushes current_function and program_counter onto the trace stack,
 /// and updates them to the new function index and entry respectively.
 /// If func is a builtin then the program_counter will be set to 0.
-fn pushCallStackFrame(vm: *Vm, func_idx: u32) VmError!void {
+fn pushStackTraceFrame(vm: *Vm, func_idx: u32) VmError!void {
     const func = vm.funcs[func_idx];
     const is_builtin = func.first_statement < 0;
     assert(func.first_statement < vm.statements.len);
 
-    if (vm.call_stack_depth == 0) {
+    if (vm.stack.trace_depth == 0) {
         assert(vm.program_counter == 0);
         assert(vm.current_function == 0);
     }
-    vm.call_stack[vm.call_stack_depth] = .{
+    vm.stack.trace[vm.stack.trace_depth] = .{
         .stmt = vm.program_counter,
         .func = vm.current_function,
     };
 
-    vm.call_stack_depth += 1;
-    if (vm.call_stack_depth >= vm.call_stack.len)
+    vm.stack.trace_depth += 1;
+    if (vm.stack.trace_depth >= vm.stack.trace.len)
         // Technically we lose the last stack frame here. Running this check first
         // (panicking on the next push) would be more efficient, but then we wouldn't
         // be able to push another frame in printStackTrace. Also, it's a nice property
-        // for vm.call_stack[vm.call_stack_depth] to never fail.
+        // for vm.stack.trace[vm.stack.trace_depth] to never fail.
         // This matches vanilla Quake behavior.
         return vm.panic("call stack overflow");
 
@@ -791,36 +800,38 @@ fn pushCallStackFrame(vm: *Vm, func_idx: u32) VmError!void {
     };
 }
 
-fn popCallStackFrame(vm: *Vm) VmError!void {
-    if (vm.call_stack_depth == 0)
+fn popStackTraceFrame(vm: *Vm) VmError!void {
+    if (vm.stack.trace_depth == 0)
         return vm.panic("call stack underflow");
 
-    vm.call_stack_depth -= 1;
-    vm.current_function = vm.call_stack[vm.call_stack_depth].func;
-    vm.program_counter = vm.call_stack[vm.call_stack_depth].stmt;
+    vm.stack.trace_depth -= 1;
+    vm.current_function = vm.stack.trace[vm.stack.trace_depth].func;
+    vm.program_counter = vm.stack.trace[vm.stack.trace_depth].stmt;
 }
 
-/// Sets up the program counter and local/call stacks.
+/// Sets up the program counter and call stack.
 /// Passing the null function is allowed.
 fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
     const func = vm.funcs[func_idx];
 
-    try pushCallStackFrame(vm, func_idx);
+    try pushStackTraceFrame(vm, func_idx);
 
-    // Confusingly, function locals (their parameters + local variables) are not stored on the local_stack, but in global memory.
-    // Each function gets a global memory region for its locals. Critically, this memory region is *reused for every invocation of the function*.
-    // Calls to a function that already appears higher up the call stack will clobber any existing locals (including parameters!),
-    // corrupting execution. Because we can't know for sure the locals won't be clobbered at runtime, we save them to the local_stack.
+    // @Note on weird stack behavior:
+    // Confusingly, function locals (their parameters + local variables) are not stored on the stack, but in global memory.
+    // Each function gets a global memory region for its locals (i.e. its frame). Critically, this memory region is *reused
+    // for every invocation of the function*. Calls to a function that already appears higher up the call stack will clobber
+    // any existing locals (including parameters!), corrupting execution. Because we can't know for sure the locals won't be
+    // clobbered at runtime, we always save them to the stack.
     // If you're wondering why carmack didn't use a stack pointer + local offsets, so am I.
     // This matches vanilla Quake behavior.
 
-    if (vm.local_stack_used + func.frame_size > vm.local_stack.len)
+    if (vm.stack.locals_used + func.frame_size > vm.stack.locals.len)
         return vm.panic("local stack overflow");
     @memcpy(
-        vm.local_stack[vm.local_stack_used..][0..func.frame_size],
+        vm.stack.locals[vm.stack.locals_used..][0..func.frame_size],
         vm.globals[func.frame_start..][0..func.frame_size],
     );
-    vm.local_stack_used += func.frame_size;
+    vm.stack.locals_used += func.frame_size;
 
     // copy arguments into function parameter registers
     var reg = func.frame_start;
@@ -838,42 +849,41 @@ fn leaveVmFunction(vm: *Vm) VmError!void {
     // It's important we do this before popping the call stack
     const current_func = vm.funcs[vm.current_function];
 
-    // restore locals from the local stack
-    const num_locals = current_func.frame_size;
-    if (num_locals > vm.local_stack_used) return vm.panic("local stack underflow");
-    vm.local_stack_used -= num_locals;
+    // restore locals from the stack
+    if (current_func.frame_size > vm.stack.locals_used) return vm.panic("local stack underflow");
+    vm.stack.locals_used -= current_func.frame_size;
 
     @memcpy(
-        vm.globals[current_func.frame_start..][0..num_locals],
-        vm.local_stack[vm.local_stack_used..][0..num_locals],
+        vm.globals[current_func.frame_start..][0..current_func.frame_size],
+        vm.stack.locals[vm.stack.locals_used..][0..current_func.frame_size],
     );
 
-    try popCallStackFrame(vm);
+    try popStackTraceFrame(vm);
 }
 
 pub fn printStackTrace(w: *std.Io.Writer, vm: *Vm) std.Io.Writer.Error!void {
-    if (vm.call_stack_depth == 0)
+    if (vm.stack.trace_depth == 0)
         return w.writeAll("<NO CALL STACK>\n");
 
     // @Performance the mutability of vm here is viral and affects the public API (logging).
     // For the sake of better codegen, maybe it's worth changing the logic here to let vm be const?
     // I dunno.
 
-    // temporarily push the current call frame so the loop below can be simpler
-    const temp_frame = vm.call_stack[vm.call_stack_depth]; // this should always be empty but just copy it anyway
-    vm.call_stack[vm.call_stack_depth] = .{
+    // temporarily push the current function so the loop below can be simpler
+    const old_trace = vm.stack.trace[vm.stack.trace_depth]; // this should always be empty but just copy it anyway
+    vm.stack.trace[vm.stack.trace_depth] = .{
         .func = vm.current_function,
         .stmt = vm.program_counter,
     };
-    defer vm.call_stack[vm.call_stack_depth] = temp_frame;
+    defer vm.stack.trace[vm.stack.trace_depth] = old_trace;
 
-    var i: u32 = vm.call_stack_depth;
+    var i: u32 = vm.stack.trace_depth;
     while (true) : (i -= 1) {
-        if (vm.call_stack[i].func == 0) {
+        if (vm.stack.trace[i].func == 0) {
             try w.writeAll("???: stmt 0 in ???\n");
         } else {
             // @Todo parse fteqcc line info and print the correct line of source code
-            const func = vm.funcs[vm.call_stack[i].func];
+            const func = vm.funcs[vm.stack.trace[i].func];
             if (func.first_statement < 0) {
                 try w.print("{s}: builtin #{d} {s}\n", .{
                     vm.getString(@bitCast(func.s_file)),
@@ -883,7 +893,7 @@ pub fn printStackTrace(w: *std.Io.Writer, vm: *Vm) std.Io.Writer.Error!void {
             } else {
                 try w.print("{s}: stmt {d} in {s}\n", .{
                     vm.getString(@bitCast(func.s_file)),
-                    vm.call_stack[i].stmt,
+                    vm.stack.trace[i].stmt,
                     vm.getString(@bitCast(func.s_name)),
                 });
             }
