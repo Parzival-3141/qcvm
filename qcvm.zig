@@ -17,6 +17,8 @@
 
 // @Todo create handle types for strings/functions/entities?
 
+// Fully renamed types/fields have their original C names in a comment above them.
+
 // etype_t
 pub const ValueType = enum(u15) {
     void,
@@ -30,24 +32,23 @@ pub const ValueType = enum(u15) {
     _,
 };
 
-// @Todo offsets actually describe the reserved starting section of vm.globals.
-// reserved_ofs is actually the length of this section.
-// refactor so this is more obvious.
-
 // OFS_*
 /// Offsets of special purpose registers in Vm.globals
 pub const SpecialRegisterOffset = enum(u16) {
     null = 0,
+    /// Padded to 3 words to hold vectors
     @"return" = 1,
-    // function arguments, filled by caller
-    parm0 = 4, // leave 3 ofs for each parm to hold vectors
-    parm1 = 7,
-    parm2 = 10,
-    parm3 = 13,
-    parm4 = 16,
-    parm5 = 19,
-    parm6 = 22,
-    parm7 = 25,
+    // parm0-7
+    /// Function arguments, filled by caller.
+    /// Each argument is padded to 3 words to hold vectors.
+    arg0 = 4,
+    arg1 = 7,
+    arg2 = 10,
+    arg3 = 13,
+    arg4 = 16,
+    arg5 = 19,
+    arg6 = 22,
+    arg7 = 25,
     pub const reserved_len = 28;
 };
 
@@ -131,13 +132,12 @@ pub const Opcode = enum(u16) {
     _,
 };
 
-// dstatement_t
 pub const Statement = extern struct {
     op: Opcode,
+    // a, b, c
     args: [3]i16,
 };
 
-// ddef_t
 pub const Def = extern struct {
     type: packed struct(u16) {
         tag: ValueType,
@@ -149,13 +149,14 @@ pub const Def = extern struct {
     s_name: u32,
 };
 
-// dfunction_t
 pub const Function = extern struct {
-    /// negative numbers are builtins
+    /// A negative value is a builtin index and marks this function as a builtin.
     first_statement: i32,
-    parm_start: u32,
-    /// total ints of parms + locals
-    locals: u32,
+    // parm_start
+    /// Offset of the function frame (parameters + local variables) in Vm.globals.
+    frame_start: u32,
+    // locals
+    frame_size: u32,
 
     /// runtime
     profile: u32,
@@ -164,10 +165,10 @@ pub const Function = extern struct {
     /// source file defined in
     s_file: u32,
 
-    numparms: u32,
-    parm_sizes: [MAX_PARMS]u8,
+    num_params: u32,
+    param_size: [MAX_PARAMETERS]u8,
 
-    pub const MAX_PARMS = 8;
+    pub const MAX_PARAMETERS = 8;
 };
 
 pub const PROG_VERSION = 6;
@@ -335,22 +336,22 @@ pub const Vm = struct {
     // it reduces casting for the user, especially when iterating up to argc.
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         assert(arg < 8);
-        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.arg0) + @as(u5, arg) * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
     pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
         assert(arg < 8);
-        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.arg0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
         assert(arg < 8);
-        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.arg0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgString(vm: *const Vm, arg: u4) [:0]const u8 {
         assert(arg < 8);
-        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.arg0) + @as(u5, arg) * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
     }
 
@@ -806,11 +807,6 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
 
     try pushCallStackFrame(vm, func_idx);
 
-    // @Cleanup @Todo rename fields and add doc comments so the function-locals semantics are more obvious.
-    // globals[parm0..][0..8*3] -> function argument registers, filled by caller
-    // globals[func.parm_start..][0..func.locals] -> function parameter and local variable registers, parameters filled by runtime
-    // local_stack[local_stack_used..] -> runtime function locals stack, see comment below
-
     // Confusingly, function locals (their parameters + local variables) are not stored on the local_stack, but in global memory.
     // Each function gets a global memory region for its locals. Critically, this memory region is *reused for every invocation of the function*.
     // Calls to a function that already appears higher up the call stack will clobber any existing locals (including parameters!),
@@ -818,24 +814,24 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
     // If you're wondering why carmack didn't use a stack pointer + local offsets, so am I.
     // This matches vanilla Quake behavior.
 
-    if (vm.local_stack_used + func.locals > vm.local_stack.len)
+    if (vm.local_stack_used + func.frame_size > vm.local_stack.len)
         return vm.panic("local stack overflow");
     @memcpy(
-        vm.local_stack[vm.local_stack_used..][0..func.locals],
-        vm.globals[func.parm_start..][0..func.locals],
+        vm.local_stack[vm.local_stack_used..][0..func.frame_size],
+        vm.globals[func.frame_start..][0..func.frame_size],
     );
-    vm.local_stack_used += func.locals;
+    vm.local_stack_used += func.frame_size;
 
     // copy arguments into function parameter registers
-    var reg = func.parm_start;
-    for (0..func.numparms) |i| {
-        for (0..func.parm_sizes[i]) |j| {
-            vm.globals[reg] = vm.globals[@backingInt(SpecialRegisterOffset.parm0) + i * 3 + j];
+    var reg = func.frame_start;
+    for (0..func.num_params) |arg_idx| {
+        for (0..func.param_size[arg_idx]) |elem_idx| {
+            vm.globals[reg] = vm.globals[@backingInt(SpecialRegisterOffset.arg0) + arg_idx * 3 + elem_idx];
             reg += 1;
         }
     }
 
-    assert(reg - func.parm_start <= func.locals);
+    assert(reg - func.frame_start <= func.frame_size);
 }
 
 fn leaveVmFunction(vm: *Vm) VmError!void {
@@ -843,12 +839,12 @@ fn leaveVmFunction(vm: *Vm) VmError!void {
     const current_func = vm.funcs[vm.current_function];
 
     // restore locals from the local stack
-    const num_locals = current_func.locals;
+    const num_locals = current_func.frame_size;
     if (num_locals > vm.local_stack_used) return vm.panic("local stack underflow");
     vm.local_stack_used -= num_locals;
 
     @memcpy(
-        vm.globals[current_func.parm_start..][0..num_locals],
+        vm.globals[current_func.frame_start..][0..num_locals],
         vm.local_stack[vm.local_stack_used..][0..num_locals],
     );
 
@@ -999,7 +995,6 @@ fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_content
     try writer.alignBuffer(sw.buffered(), 25, .left, ' ');
 }
 
-// @Cleanup is this even worth keeping?
 pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (vm.funcs, 0..) |func, i| {
         if (func.first_statement == 0) {
@@ -1019,10 +1014,10 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print(" entry=0x{X}", .{func.first_statement});
         }
 
-        try w.print(", param_start=0x{X}, #params={d}, #locals={d}", .{
-            func.parm_start,
-            func.numparms,
-            func.locals,
+        try w.print(", frame_start=0x{X}, frame_size={d}, #params={d}", .{
+            func.frame_start,
+            func.frame_size,
+            func.num_params,
         });
 
         try w.writeByte('\n');
