@@ -1,17 +1,16 @@
 const std = @import("std");
-const quakec = @import("qcvm.zig");
+const quakec = @import("qcvm");
 
-pub fn main() !void {
-    var arena_inst: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
 
-    var args = std.process.args();
+    var args = init.minimal.args.iterate();
     std.debug.assert(args.skip());
 
     const file_path = args.next() orelse return error.MissingArgument;
     const verbose = if (args.next()) |arg| std.mem.eql(u8, arg, "-v") else false;
-    const prog_data = try std.fs.cwd().readFileAlloc(arena, file_path, 64 * 1024 * 1024);
+    const prog_data = try std.Io.Dir.cwd().readFileAlloc(io, file_path, arena, .limited(64 * 1024 * 1024));
 
     var qcvm: quakec.Vm = .blank;
     try quakec.loadProgram(&qcvm, prog_data, false);
@@ -19,6 +18,7 @@ pub fn main() !void {
     qcvm.num_entities = 32;
     qcvm.entity_memory = try arena.alloc(u32, qcvm.num_entities * qcvm.num_entity_fields);
     qcvm.temporary_strings_buffer = try arena.allocSentinel(u8, 1024, 0);
+    qcvm.userdata = @ptrCast(@constCast(&io));
     qcvm.builtins = &.{
         vmSpawn,
         vmPrintf,
@@ -42,9 +42,10 @@ fn vmSpawn(vm: *quakec.Vm) quakec.VmError!void {
 fn vmPrintf(vm: *quakec.Vm) quakec.VmError!void {
     if (vm.argc == 0) return vm.panic("too few arguments");
     const fmt = vm.getArgString(0);
+    const io: *const std.Io = @ptrCast(@alignCast(vm.userdata.?));
 
     var buf: [256]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
+    var stdout = std.Io.File.stdout().writer(io.*, &buf);
 
     vmPrintInner(vm, fmt, &stdout.interface) catch return vm.panic("write error");
     stdout.end() catch return vm.panic("write error");

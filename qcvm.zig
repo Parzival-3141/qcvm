@@ -29,9 +29,13 @@ pub const ValueType = enum(u15) {
     _,
 };
 
+// @Todo offsets actually describe the reserved starting section of vm.globals.
+// reserved_ofs is actually the length of this section.
+// refactor so this is more obvious.
 pub const Offset = enum(u16) {
     null = 0,
     @"return" = 1,
+    // function arguments, filled by caller
     parm0 = 4, // leave 3 ofs for each parm to hold vectors
     parm1 = 7,
     parm2 = 10,
@@ -40,7 +44,7 @@ pub const Offset = enum(u16) {
     parm5 = 19,
     parm6 = 22,
     parm7 = 25,
-    reserved_ofs = 28,
+    pub const reserved_len = 28;
 };
 
 pub const Opcode = enum(u16) {
@@ -185,7 +189,7 @@ pub const Header = extern struct {
     num_functions: u32,
 
     ofs_strings: u32,
-    /// first string is a null string
+    /// includes the null terminator. first string is a null string
     size_strings: u32,
 
     ofs_globals: u32,
@@ -233,6 +237,8 @@ pub const Vm = struct {
 
     /// User supplied builtin functions
     builtins: []const BuiltinFn,
+    /// User supplied data accessible in builtin functions
+    userdata: ?*anyopaque,
 
     // Entities are stored in a seperate memory region that the user supplies.
     // The size of this memory region must be at least
@@ -299,6 +305,7 @@ pub const Vm = struct {
 
         .argc = 0,
         .builtins = &.{},
+        .userdata = null,
 
         .entity_memory = &.{},
         .num_entities = 0,
@@ -324,33 +331,33 @@ pub const Vm = struct {
     // it reduces casting for the user, especially when iterating up to argc.
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
     pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgString(vm: *const Vm, arg: u4) [:0]const u8 {
         assert(arg < 8);
-        const offset = @intFromEnum(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
     }
 
     pub fn setReturnValueVector(vm: *Vm, vec: [3]f32) void {
-        for (0..3) |i| vm.globals[@intFromEnum(Offset.@"return") + i] = @bitCast(vec[i]);
+        for (0..3) |i| vm.globals[@backingInt(Offset.@"return") + i] = @bitCast(vec[i]);
     }
     pub fn setReturnValueEntityIndex(vm: *Vm, entity: u32) void {
-        vm.globals[@intFromEnum(Offset.@"return")] = entity;
+        vm.globals[@backingInt(Offset.@"return")] = entity;
     }
     pub fn setReturnValueFloat(vm: *Vm, float: f32) void {
-        vm.globals[@intFromEnum(Offset.@"return")] = @bitCast(float);
+        vm.globals[@backingInt(Offset.@"return")] = @bitCast(float);
     }
     /// Copies the string into temporary_strings_buffer.
     /// If there is not enough space it will return the null string value instead.
@@ -358,7 +365,7 @@ pub const Vm = struct {
         if (string.len <= vm.temporary_strings_buffer.len) {
             vm.setReturnValueStringAssumeCapacity(string);
         } else {
-            vm.globals[@intFromEnum(Offset.@"return")] = 0;
+            vm.globals[@backingInt(Offset.@"return")] = 0;
             // @Incomplete return an error?
         }
     }
@@ -379,7 +386,7 @@ pub const Vm = struct {
     /// temporary_strings_buffer, otherwise call setReturnValueString.
     pub fn setReturnValueManuallyFilledTempString(vm: *Vm, start_idx: u31) void {
         vm.temporary_strings_buffer[vm.temporary_strings_buffer.len] = 0; // maintain sentinel, just in case!
-        vm.globals[@intFromEnum(Offset.@"return")] =
+        vm.globals[@backingInt(Offset.@"return")] =
             @bitCast(@as(i32, -1) - start_idx);
     }
 
@@ -431,16 +438,17 @@ pub const LoggerMode = union(enum) {
 /// Log to stderr.
 pub fn defaultLogger(vm: *Vm, mode: LoggerMode) void {
     var buffer: [64]u8 = undefined;
-    const stderr = std.debug.lockStderrWriter(&buffer);
-    defer std.debug.unlockStderrWriter();
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    const w = &stderr.file_writer.interface;
 
     nosuspend switch (mode) {
         .panic => |msg| {
-            stderr.print("panic: {s}\n", .{msg}) catch {};
-            printStackTrace(stderr, vm) catch {};
+            w.print("panic: {s}\n", .{msg}) catch {};
+            printStackTrace(w, vm) catch {};
         },
         .statement => |stmt| {
-            printStatement(stderr, vm, stmt) catch {};
+            printStatement(w, vm, stmt) catch {};
         },
     };
 }
@@ -474,7 +482,7 @@ pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) LoadProgramEr
     }
 
     // zig fmt: off
-    const strings:    [:0]u8      =                     bytes[hdr.ofs_strings   ..][0..hdr.size_strings                       :0];
+    const strings:    [:0]u8      =                     bytes[hdr.ofs_strings   ..][0..hdr.size_strings  -| 1                 :0];
     const funcs:      []Function  = @ptrCast(@alignCast(bytes[hdr.ofs_functions ..][0..hdr.num_functions  * @sizeOf(Function) ]));
     const globaldefs: []Def       = @ptrCast(@alignCast(bytes[hdr.ofs_globaldefs..][0..hdr.num_globaldefs * @sizeOf(Def)      ]));
     const fielddefs:  []Def       = @ptrCast(@alignCast(bytes[hdr.ofs_fielddefs ..][0..hdr.num_fielddefs  * @sizeOf(Def)      ]));
@@ -687,7 +695,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
             .call7,
             .call8,
             => |call| {
-                const num_args: u4 = @intCast(@intFromEnum(call) - @intFromEnum(Opcode.call0));
+                const num_args: u4 = @intCast(@backingInt(call) - @backingInt(Opcode.call0));
 
                 if (a.function == 0) return vm.panic("attempted to call null function");
                 const next_func = vm.funcs[a.function];
@@ -724,7 +732,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
 
             inline .done, .@"return" => |op| {
                 if (op == .@"return") @memcpy(
-                    vm.globals[@intFromEnum(Offset.@"return")..][0..3],
+                    vm.globals[@backingInt(Offset.@"return")..][0..3],
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
                 try leaveVmFunction(vm);
@@ -736,7 +744,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                 return vm.panic("unimplemented opcode: state"); // @Incomplete
             },
 
-            _ => |op| return vm.panicExtra("invalid opcode: {d}", .{@intFromEnum(op)}),
+            _ => |op| return vm.panicExtra("invalid opcode: {d}", .{@backingInt(op)}),
         }
 
         vm.program_counter +%= 1;
@@ -794,9 +802,18 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
 
     try pushCallStackFrame(vm, func_idx);
 
-    // Save any locals the new function would overwrite.
-    // This can cause redundant copies in the pathological case,
-    // but is otherwise necessary.
+    // @Cleanup @Todo rename fields and add doc comments so the function-locals semantics are more obvious.
+    // globals[parm0..][0..8*3] -> function argument registers, filled by caller
+    // globals[func.parm_start..][0..func.locals] -> function parameter and local variable registers, parameters filled by runtime
+    // local_stack[local_stack_used..] -> runtime function locals stack, see comment below
+
+    // Confusingly, function locals (their parameters + local variables) are not stored on the local_stack, but in global memory.
+    // Each function gets a global memory region for its locals. Critically, this memory region is *reused for every invocation of the function*.
+    // Calls to a function that already appears higher up the call stack will clobber any existing locals (including parameters!),
+    // corrupting execution. Because we can't know for sure the locals won't be clobbered at runtime, we save them to the local_stack.
+    // If you're wondering why carmack didn't use a stack pointer + local offsets, so am I.
+    // This matches vanilla Quake behavior.
+
     if (vm.local_stack_used + func.locals > vm.local_stack.len)
         return vm.panic("local stack overflow");
     @memcpy(
@@ -805,14 +822,16 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
     );
     vm.local_stack_used += func.locals;
 
-    // copy parameters into global registers
+    // copy arguments into function parameter registers
     var reg = func.parm_start;
     for (0..func.numparms) |i| {
         for (0..func.parm_sizes[i]) |j| {
-            vm.globals[reg] = vm.globals[@intFromEnum(Offset.parm0) + i * 3 + j];
+            vm.globals[reg] = vm.globals[@backingInt(Offset.parm0) + i * 3 + j];
             reg += 1;
         }
     }
+
+    assert(reg - func.parm_start <= func.locals);
 }
 
 fn leaveVmFunction(vm: *Vm) VmError!void {
@@ -894,7 +913,7 @@ pub fn printStatement(w: *std.Io.Writer, vm: *const Vm, stmt: Statement) std.Io.
     switch (stmt.op) {
         else => |op| try w.print("{t: <10} ", .{op}),
         _ => |op| {
-            return w.print("invalid opcode: {d}", .{@intFromEnum(op)});
+            return w.print("invalid opcode: {d}", .{@backingInt(op)});
         },
     }
 
@@ -967,7 +986,7 @@ fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_content
                 try sw.print("{s}()", .{vm.getString(@bitCast(func.s_name))});
             },
             .pointer => try sw.writeAll("pointer"),
-            _ => |t| try sw.print("bad type {d}", .{@intFromEnum(t)}),
+            _ => |t| try sw.print("bad type {d}", .{@backingInt(t)}),
         }
     } else {
         try sw.print("{d}(???)", .{offset});
@@ -996,7 +1015,8 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print(" entry=0x{X}", .{func.first_statement});
         }
 
-        try w.print(", #params={d}, #locals={d}", .{
+        try w.print(", param_start=0x{X}, #params={d}, #locals={d}", .{
+            func.parm_start,
             func.numparms,
             func.locals,
         });
@@ -1040,5 +1060,35 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
         });
     }
 
-    try w.print("globals: {any}\n", .{vm.globals});
+    const Offset_info = @typeInfo(Offset).@"enum";
+    inline for (Offset_info.field_names, Offset_info.field_values) |name, value| {
+        try w.print("global[{s: >6}]: {any}\n", .{ name, switch (@field(Offset, name)) {
+            .null => vm.globals[value],
+            else => vm.globals[value..][0..3],
+        } });
+    }
+
+    var i: u32 = Offset.reserved_len;
+    while (i < vm.globals.len) : (i += 1) {
+        try w.print("global[0x{X: <2}]:", .{i});
+        const global = vm.globals[i];
+
+        if (getDefAtOffset(vm.globaldefs, @intCast(i))) |def| {
+            switch (def.type.tag) {
+                .float => {
+                    try w.print(" {d:.2} ({s})\n", .{ @as(f32, @bitCast(global)), vm.getString(@bitCast(def.s_name)) });
+                },
+                .vector => {
+                    const vec: *[3]f32 = @ptrCast(vm.globals[i..][0..3]);
+                    try w.print(" {{ {d:.2}, {d:.2}, {d:.2} }} ({s})\n", .{ vec[0], vec[1], vec[2], vm.getString(@bitCast(def.s_name)) });
+                    i += 2;
+                },
+                else => {
+                    try w.print(" {d: <4} ({s})\n", .{ global, vm.getString(@bitCast(def.s_name)) });
+                },
+            }
+        } else {
+            try w.print(" {d}\n", .{global});
+        }
+    }
 }

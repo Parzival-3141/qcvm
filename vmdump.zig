@@ -1,0 +1,21 @@
+const std = @import("std");
+const quakec = @import("qcvm.zig");
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    var args = init.minimal.args.iterate();
+    std.debug.assert(args.skip());
+
+    const file_path = args.next() orelse return error.MissingArgument;
+    const prog_data = try std.Io.Dir.cwd().readFileAlloc(io, file_path, arena, .limited(64 * 1024 * 1024));
+
+    var qcvm: quakec.Vm = .blank;
+    try quakec.loadProgram(&qcvm, prog_data, false);
+
+    const buf = try arena.alloc(u8, 256);
+    var stdout = std.Io.File.stdout().writer(io, buf);
+    try quakec.dumpVm(qcvm, &stdout.interface);
+    try stdout.end();
+}
