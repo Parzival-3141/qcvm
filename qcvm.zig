@@ -17,6 +17,7 @@
 
 // @Todo create handle types for strings/functions/entities?
 
+// etype_t
 pub const ValueType = enum(u15) {
     void,
     string,
@@ -32,7 +33,10 @@ pub const ValueType = enum(u15) {
 // @Todo offsets actually describe the reserved starting section of vm.globals.
 // reserved_ofs is actually the length of this section.
 // refactor so this is more obvious.
-pub const Offset = enum(u16) {
+
+// OFS_*
+/// Offsets of special purpose registers in Vm.globals
+pub const SpecialRegisterOffset = enum(u16) {
     null = 0,
     @"return" = 1,
     // function arguments, filled by caller
@@ -331,33 +335,33 @@ pub const Vm = struct {
     // it reduces casting for the user, especially when iterating up to argc.
     pub fn getArgVector(vm: *const Vm, arg: u4) *const [3]f32 {
         assert(arg < 8);
-        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
         return @ptrCast(vm.globals[offset..][0..3]);
     }
     pub fn getArgInt(vm: *const Vm, arg: u4) i32 {
         assert(arg < 8);
-        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgFloat(vm: *const Vm, arg: u4) f32 {
         assert(arg < 8);
-        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
         return @bitCast(vm.globals[offset]);
     }
     pub fn getArgString(vm: *const Vm, arg: u4) [:0]const u8 {
         assert(arg < 8);
-        const offset = @backingInt(Offset.parm0) + @as(u5, arg) * 3;
+        const offset = @backingInt(SpecialRegisterOffset.parm0) + @as(u5, arg) * 3;
         return getString(vm, @bitCast(vm.globals[offset]));
     }
 
     pub fn setReturnValueVector(vm: *Vm, vec: [3]f32) void {
-        for (0..3) |i| vm.globals[@backingInt(Offset.@"return") + i] = @bitCast(vec[i]);
+        for (0..3) |i| vm.globals[@backingInt(SpecialRegisterOffset.@"return") + i] = @bitCast(vec[i]);
     }
     pub fn setReturnValueEntityIndex(vm: *Vm, entity: u32) void {
-        vm.globals[@backingInt(Offset.@"return")] = entity;
+        vm.globals[@backingInt(SpecialRegisterOffset.@"return")] = entity;
     }
     pub fn setReturnValueFloat(vm: *Vm, float: f32) void {
-        vm.globals[@backingInt(Offset.@"return")] = @bitCast(float);
+        vm.globals[@backingInt(SpecialRegisterOffset.@"return")] = @bitCast(float);
     }
     /// Copies the string into temporary_strings_buffer.
     /// If there is not enough space it will return the null string value instead.
@@ -365,7 +369,7 @@ pub const Vm = struct {
         if (string.len <= vm.temporary_strings_buffer.len) {
             vm.setReturnValueStringAssumeCapacity(string);
         } else {
-            vm.globals[@backingInt(Offset.@"return")] = 0;
+            vm.globals[@backingInt(SpecialRegisterOffset.@"return")] = 0;
             // @Incomplete return an error?
         }
     }
@@ -386,7 +390,7 @@ pub const Vm = struct {
     /// temporary_strings_buffer, otherwise call setReturnValueString.
     pub fn setReturnValueManuallyFilledTempString(vm: *Vm, start_idx: u31) void {
         vm.temporary_strings_buffer[vm.temporary_strings_buffer.len] = 0; // maintain sentinel, just in case!
-        vm.globals[@backingInt(Offset.@"return")] =
+        vm.globals[@backingInt(SpecialRegisterOffset.@"return")] =
             @bitCast(@as(i32, -1) - start_idx);
     }
 
@@ -732,7 +736,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
 
             inline .done, .@"return" => |op| {
                 if (op == .@"return") @memcpy(
-                    vm.globals[@backingInt(Offset.@"return")..][0..3],
+                    vm.globals[@backingInt(SpecialRegisterOffset.@"return")..][0..3],
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
                 try leaveVmFunction(vm);
@@ -826,7 +830,7 @@ fn enterVmFunction(vm: *Vm, func_idx: u32) VmError!void {
     var reg = func.parm_start;
     for (0..func.numparms) |i| {
         for (0..func.parm_sizes[i]) |j| {
-            vm.globals[reg] = vm.globals[@backingInt(Offset.parm0) + i * 3 + j];
+            vm.globals[reg] = vm.globals[@backingInt(SpecialRegisterOffset.parm0) + i * 3 + j];
             reg += 1;
         }
     }
@@ -1060,15 +1064,15 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
         });
     }
 
-    const Offset_info = @typeInfo(Offset).@"enum";
-    inline for (Offset_info.field_names, Offset_info.field_values) |name, value| {
-        try w.print("global[{s: >6}]: {any}\n", .{ name, switch (@field(Offset, name)) {
+    const info = @typeInfo(SpecialRegisterOffset).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        try w.print("global[{s: >6}]: {any}\n", .{ name, switch (@field(SpecialRegisterOffset, name)) {
             .null => vm.globals[value],
             else => vm.globals[value..][0..3],
         } });
     }
 
-    var i: u32 = Offset.reserved_len;
+    var i: u32 = SpecialRegisterOffset.reserved_len;
     while (i < vm.globals.len) : (i += 1) {
         try w.print("global[0x{X: <2}]:", .{i});
         const global = vm.globals[i];
