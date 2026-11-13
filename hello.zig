@@ -5,7 +5,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(arena);
     std.debug.assert(args.skip());
 
     const file_path = args.next() orelse return error.MissingArgument;
