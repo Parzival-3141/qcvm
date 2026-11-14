@@ -613,7 +613,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
             .@"or" => c.float = floatFromBool(a.float != 0 or b.float != 0),
 
             .not_f => c.float = floatFromBool(a.float == 0),
-            .not_v => c.float = floatFromBool(a.vector[0] == 0 and a.vector[1] == 0 and a.vector[1] == 0),
+            .not_v => c.float = floatFromBool(a.vector[0] == 0 and a.vector[1] == 0 and a.vector[2] == 0),
             .not_s => c.float = floatFromBool(a.string == 0 or vm.getString(a.string)[0] == 0), // check if string is null or empty
             .not_ent => c.float = floatFromBool(a.entity_index == 0), // the 0th entity should be considered null and therefore false-y
             .not_fnc => c.float = floatFromBool(a.function == 0), // same with functions
@@ -934,7 +934,7 @@ pub fn printStatement(w: *std.Io.Writer, vm: *const Vm, stmt: Statement) std.Io.
             try w.print("branch {d}", .{stmt.args[1]});
         },
         .goto => {
-            try w.print("branch {d}", .{stmt.args[1]});
+            try w.print("branch {d}", .{stmt.args[0]});
         },
         .store_f,
         .store_v,
