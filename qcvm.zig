@@ -573,10 +573,12 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
             entity_field_address: u32,
         };
 
-        // Global registers accessed by statement arguments
+        // Global registers accessed by statement arguments. The branch operand of
+        // goto/if/ifnot holds a statement offset instead of a global index, so
+        // substitute the null register; the branch logic reads it from stmt.args.
         // @Todo bounds checking for vectors, indices, etc. We should not trust user input!
-        const a: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[0])]);
-        const b: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[1])]);
+        const a: *GlobalValue = @ptrCast(&vm.globals[@intCast(if (stmt.op == .goto) 0 else stmt.args[0])]);
+        const b: *GlobalValue = @ptrCast(&vm.globals[@intCast(if (stmt.op == .@"if" or stmt.op == .ifnot) 0 else stmt.args[1])]);
         const c: *GlobalValue = @ptrCast(&vm.globals[@intCast(stmt.args[2])]);
 
         switch (stmt.op) {
@@ -694,8 +696,9 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                     else => unreachable,
                 };
                 if (jump) {
-                    // note this is equivalent to program_counter +%= @as(i16, offset)
-                    vm.program_counter +%= @as(u16, @bitCast(offset));
+                    // sign extend the offset so that backwards jumps can underflow
+                    // and forwards jumps can overflow the program counter
+                    vm.program_counter +%= @as(u32, @bitCast(@as(i32, offset)));
                     continue; // don't increment counter
                 }
             },
