@@ -751,7 +751,7 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                     vm.globals[@intCast(stmt.args[0])..][0..3],
                 );
                 try leaveVmFunction(vm);
-                if (op == .done or exit_depth == vm.stack.trace_depth)
+                if (exit_depth == vm.stack.trace_depth)
                     break :run_loop; // all done
             },
 
