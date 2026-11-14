@@ -1060,10 +1060,51 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
             });
     }
 
+    const GlobalValueFmt = struct {
+        vm: *const Vm,
+        def: *const Def,
+
+        pub fn format(t: @This(), w_: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (t.def.type.tag) {
+                .vector => {
+                    const vec: *[3]f32 = @ptrCast(t.vm.globals[t.def.offset..][0..3]);
+                    try w_.print("{{{d:.1},{d:.1},{d:.1}}}", .{ vec[0], vec[1], vec[2] });
+                },
+                .float => try w_.print("{d:.2}", .{@as(f32, @bitCast(t.vm.globals[t.def.offset]))}),
+                else => try w_.print("{d: <4}", .{t.vm.globals[t.def.offset]}),
+            }
+        }
+    };
+
+    const printStmtArg = struct {
+        fn printStmtArg(w_: *std.Io.Writer, vm_: *const Vm, arg: u16) !void {
+            if (arg == @backingInt(SpecialRegisterOffset.null)) {
+                try w_.writeByte('_');
+            } else if (getDefAtOffset(vm_.globaldefs, arg)) |def| {
+                const name = vm_.getString(@bitCast(def.s_name));
+                if (std.mem.eql(u8, name, "IMMEDIATE")) {
+                    try w_.print("${f}", .{GlobalValueFmt{ .vm = vm_, .def = def }});
+                } else {
+                    try w_.print("%{s}", .{name});
+                }
+            } else {
+                try w_.print("[0x{X:0>2}]", .{arg});
+            }
+        }
+    }.printStmtArg;
+
     for (vm.statements, 0..) |stmt, i| {
-        try w.print("statement[{d}] {t: >10}: a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
-            i,
-            stmt.op,
+        try w.print("statement[{d: >2}] {t: >10}: ", .{ i, stmt.op });
+
+        for (&stmt.args, 0..) |arg, j| {
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            try printStmtArg(&discard.writer, &vm, @bitCast(arg));
+            try printStmtArg(w, &vm, @bitCast(arg));
+            const spacing: u8 = if (j < stmt.args.len - 1) 12 else 6;
+            try w.splatByteAll(' ', 1 + (spacing -| discard.fullCount()));
+        }
+
+        try w.print(" a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
             @as(u16, @bitCast(stmt.args[0])),
             @as(u16, @bitCast(stmt.args[1])),
             @as(u16, @bitCast(stmt.args[2])),
@@ -1084,19 +1125,11 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const global = vm.globals[i];
 
         if (getDefAtOffset(vm.globaldefs, @intCast(i))) |def| {
-            switch (def.type.tag) {
-                .float => {
-                    try w.print(" {d:.2} ({s})\n", .{ @as(f32, @bitCast(global)), vm.getString(@bitCast(def.s_name)) });
-                },
-                .vector => {
-                    const vec: *[3]f32 = @ptrCast(vm.globals[i..][0..3]);
-                    try w.print(" {{ {d:.2}, {d:.2}, {d:.2} }} ({s})\n", .{ vec[0], vec[1], vec[2], vm.getString(@bitCast(def.s_name)) });
-                    i += 2;
-                },
-                else => {
-                    try w.print(" {d: <4} ({s})\n", .{ global, vm.getString(@bitCast(def.s_name)) });
-                },
-            }
+            try w.print(" {f} ({s}: {t})\n", .{
+                GlobalValueFmt{ .vm = &vm, .def = def },
+                vm.getString(@bitCast(def.s_name)),
+                def.type.tag,
+            });
         } else {
             try w.print(" {d}\n", .{global});
         }
