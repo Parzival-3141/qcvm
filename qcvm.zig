@@ -1012,11 +1012,11 @@ fn printGlobal(writer: *std.Io.Writer, vm: *const Vm, offset: u32, print_content
 pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (vm.funcs, 0..) |func, i| {
         if (func.first_statement == 0) {
-            try w.print("function[{d}] null\n", .{i});
+            try w.print("function[{d}]: null\n", .{i});
             continue;
         }
 
-        try w.print("function[{d}] {s}:{s}:", .{
+        try w.print("function[{d}]: {s}:{s}:", .{
             i,
             vm.getString(@bitCast(func.s_file)),
             vm.getString(@bitCast(func.s_name)),
@@ -1039,9 +1039,9 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
     for (vm.globaldefs, 0..) |def, i| {
         if (def.offset == 0)
-            try w.print("globaldef[{d}] null\n", .{i})
+            try w.print("globaldef[{d}]: null\n", .{i})
         else
-            try w.print("globaldef[{d}] {s}: type={t}, offset=0x{X}, save={}\n", .{
+            try w.print("globaldef[{d}]: {s}: type={t}, offset=0x{X}, save={}\n", .{
                 i,
                 vm.getString(@bitCast(def.s_name)),
                 def.type.tag,
@@ -1052,9 +1052,9 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
     for (vm.fielddefs, 0..) |def, i| {
         if (def.offset == 0)
-            try w.print("fielddef[{d}] null\n", .{i})
+            try w.print("fielddef[{d}]: null\n", .{i})
         else
-            try w.print("fielddef[{d}] {s}: type={t}, offset=0x{X}, save={}\n", .{
+            try w.print("fielddef[{d}]: {s}: type={t}, offset=0x{X}, save={}\n", .{
                 i,
                 vm.getString(@bitCast(def.s_name)),
                 def.type.tag,
@@ -1079,8 +1079,8 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
         }
     };
 
-    const printStmtArg = struct {
-        fn printStmtArg(w_: *std.Io.Writer, vm_: *const Vm, arg: u16) !void {
+    const StmtPrinter = struct {
+        fn printArg(w_: *std.Io.Writer, vm_: *const Vm, arg: u16) !void {
             if (arg == @backingInt(SpecialRegisterOffset.null)) {
                 try w_.writeByte('_');
             } else if (getDefAtOffset(vm_.globaldefs, arg)) |def| {
@@ -1094,17 +1094,67 @@ pub fn dumpVm(vm: Vm, w: *std.Io.Writer) std.Io.Writer.Error!void {
                 try w_.print("[0x{X:0>2}]", .{arg});
             }
         }
-    }.printStmtArg;
+
+        fn printOperand(w_: *std.Io.Writer, vm_: *const Vm, stmt_idx: usize, arg_idx: usize) !void {
+            const stmt = vm_.statements[stmt_idx];
+            const branch: ?usize = switch (stmt.op) {
+                .goto => 0,
+                .@"if", .ifnot => 1,
+                else => null,
+            };
+            if (branch == arg_idx) {
+                // if/ifnot/goto keep their branch offset in one of the operands;
+                // print it as an absolute statement index instead.
+                try w_.print("->{d}", .{@as(i32, @intCast(stmt_idx)) + stmt.args[arg_idx]});
+            } else {
+                try printArg(w_, vm_, @bitCast(stmt.args[arg_idx]));
+            }
+        }
+
+        fn opcodeName(buf: []u8, op: Opcode) []const u8 {
+            const value = @backingInt(op);
+            inline for (@typeInfo(Opcode).@"enum".field_names) |name| {
+                if (@backingInt(@field(Opcode, name)) == value) return name;
+            }
+            return std.fmt.bufPrint(buf, "invalid(0x{X})", .{value}) catch "invalid";
+        }
+    };
+
+    const mnemonic_width = comptime blk: {
+        var len = 0;
+        for (@typeInfo(Opcode).@"enum".field_names) |name| {
+            len = @max(len, name.len);
+        }
+        break :blk len;
+    };
+
+    var buf: [128]u8 = undefined; // shared
+
+    const operand_width: usize = blk: {
+        var width: usize = 0;
+        for (vm.statements, 0..) |stmt, i| {
+            for (0..stmt.args.len) |j| {
+                var sw: std.Io.Writer = .fixed(&buf);
+                StmtPrinter.printOperand(&sw, &vm, i, j) catch {}; // truncated on overflow
+                width = @max(width, sw.buffered().len);
+            }
+        }
+        break :blk width;
+    };
 
     for (vm.statements, 0..) |stmt, i| {
-        try w.print("statement[{d: >2}] {t: >10}: ", .{ i, stmt.op });
+        try w.print("statement[{d: >2}]: ", .{i});
 
-        for (&stmt.args, 0..) |arg, j| {
-            var discard: std.Io.Writer.Discarding = .init(&.{});
-            try printStmtArg(&discard.writer, &vm, @bitCast(arg));
-            try printStmtArg(w, &vm, @bitCast(arg));
-            const spacing: u8 = if (j < stmt.args.len - 1) 12 else 6;
-            try w.splatByteAll(' ', 1 + (spacing -| discard.fullCount()));
+        const op_name = StmtPrinter.opcodeName(&buf, stmt.op);
+        try w.writeAll(op_name);
+        try w.splatByteAll(' ', mnemonic_width -| op_name.len + 1);
+
+        for (0..stmt.args.len) |j| {
+            var sw: std.Io.Writer = .fixed(&buf);
+            StmtPrinter.printOperand(&sw, &vm, i, j) catch {}; // truncated on overflow
+            try w.writeAll(sw.buffered());
+            try w.splatByteAll(' ', operand_width -| sw.buffered().len);
+            if (j + 1 < stmt.args.len) try w.splatByteAll(' ', 2);
         }
 
         try w.print(" a=0x{X:0>2} b=0x{X:0>2} c=0x{X:0>2}\n", .{
