@@ -605,9 +605,12 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
                 a.vector[2] * b.vector[2],
 
             .bitand, .bitor => |op| {
-                // this casting is weird but matches Quake behavior
-                const ai: i32 = @intFromFloat(a.float);
-                const bi: i32 = @intFromFloat(b.float);
+                // This casting is weird but matches Quake behavior, except for out-of-range floats.
+                // Quake doesn't check the range at all and ends up depending on UB. Here we use lossyCast
+                // to avoid a runtime panic/UB, which does result in different values, but they're garbage
+                // anyway. Sane code would not depend on this behavior!
+                const ai = std.math.lossyCast(i32, a.float);
+                const bi = std.math.lossyCast(i32, b.float);
                 c.float = @floatFromInt(if (op == .bitand) ai & bi else ai | bi);
             },
             // the following "floatFromBool" casts are weird but match Quake behavior
@@ -617,8 +620,8 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
             .not_f => c.float = floatFromBool(a.float == 0),
             .not_v => c.float = floatFromBool(a.vector[0] == 0 and a.vector[1] == 0 and a.vector[2] == 0),
             .not_s => c.float = floatFromBool(a.string == 0 or vm.getString(a.string)[0] == 0), // check if string is null or empty
-            .not_ent => c.float = floatFromBool(a.entity_index == 0), // the 0th entity should be considered null and therefore false-y
-            .not_fnc => c.float = floatFromBool(a.function == 0), // same with functions
+            .not_ent => c.float = floatFromBool(a.entity_index == 0), // the 0th entity (world entity) doubles as the false-y/null entity. This matches vanilla Quake behavior.
+            .not_fnc => c.float = floatFromBool(a.function == 0), // the 0th function is the null function
 
             .eq_f => c.float = floatFromBool(a.float == b.float),
             .eq_v => c.float = floatFromBool(std.mem.eql(f32, &a.vector, &b.vector)),
@@ -677,14 +680,16 @@ pub fn exec(vm: *Vm, func_name: []const u8) ExecError!void {
 
             // store entity field address in global register
             .address => {
-                // The address instruction returns a host defined entity field id, which is used in
-                // storep_* instructions. The reason it's done this way is so the host entity data structure
-                // does not have to directly match the QuakeC representation. In other words, all QC entity fields do not have
-                // to be stored contiguously in memory. Quake utilizes this feature to store entities in the Edict (Entity Dictionary)
-                // data structure, which is why it returns an offset in bytes instead of ints.
+                // The address instruction returns a host defined entity field address, which is used in
+                // storep_* instructions. The reason it's done this way is so the host's entity data structure
+                // doesn't have to mirror the QuakeC representation. In other words, all QC entity fields do not have
+                // to be stored contiguously in memory. Quake utilizes this feature to store entities in the edict
+                // (Entity Dictionary) data structure, and returns byte offset into the edict pool instead of a
+                // field offset in ints.
                 //
-                // Here we have no such limitation, so just return the offset in ints. In the future,
+                // Here our entity storage is flat, so just return the field offset directly. In the future,
                 // we could let the user define this mapping via a callback so they can use their own data layout.
+                if (a.entity_index == 0) return vm.panic("assignment to world entity"); // @Todo allow user to disable check?
                 c.entity_field_address = a.entity_index * vm.num_entity_fields + b.entity_field_offset;
             },
 
