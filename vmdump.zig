@@ -9,7 +9,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.assert(args.skip());
 
     const file_path = args.next() orelse return error.MissingArgument;
-    const prog_data = try std.Io.Dir.cwd().readFileAlloc(io, file_path, arena, .limited(64 * 1024 * 1024));
+    const prog_data = try std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        file_path,
+        arena,
+        .limited(64 * 1024 * 1024),
+        .of(quakec.Header),
+        null,
+    );
 
     var qcvm: quakec.Vm = .blank;
     try quakec.loadProgram(&qcvm, prog_data, false);

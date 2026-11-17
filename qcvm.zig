@@ -470,11 +470,11 @@ pub fn defaultLogger(vm: *Vm, mode: LoggerMode) void {
 
 pub const LoadProgramError = error{ WrongVersion, InvalidChecksum };
 
-pub fn loadProgram(vm: *Vm, bytes: []u8, check_progdefs_crc: bool) LoadProgramError!void {
+pub fn loadProgram(vm: *Vm, bytes: []align(@alignOf(Header)) u8, check_progdefs_crc: bool) LoadProgramError!void {
     var progs_crc = crc.init;
     for (bytes) |b| crc.processByte(&progs_crc, b);
 
-    const hdr: *Header = @ptrCast(@alignCast(bytes.ptr));
+    const hdr: *Header = @ptrCast(bytes);
     if (native_endian == .big) std.mem.byteSwapAllFields(Header, hdr);
 
     if (hdr.version != PROG_VERSION) {
